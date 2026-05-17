@@ -4,12 +4,10 @@ Bloomberg-style Bitcoin terminal dashboard untuk investor, dibangun dengan Pytho
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
-```
 <p align="center">
   <img src="asset/ss1.jpg" alt="Screenshot Aplikasi-1" width="750">
   <img src="asset/ss2.jpg" alt="Screenshot Aplikasi-2" width="750">
 </p>
-```
 
 ## Features
 
