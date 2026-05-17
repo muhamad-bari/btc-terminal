@@ -1,6 +1,6 @@
 """Textual dashboard for long-term Bitcoin investors.
 
-Bloomberg-style terminal with dynamic indicators, AI zones, and macro intel.
+    Bloomberg-style terminal with dynamic indicators, order blocks, and macro intel.
 """
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Click
 from textual.reactive import reactive
 from textual.widgets import Checkbox, Footer, Header, Input, Static
 from textual.worker import get_current_worker
@@ -26,7 +28,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(project_root))
 
 from btc_investor_tui.data_engine import get_btc_dashboard_data, recalculate_indicators
-from btc_investor_tui.ai_zones import get_ai_zones, _get_token, save_token
+from btc_investor_tui.ai_zones import get_order_block_commentary, _get_token, save_token
 from btc_investor_tui.chart_renderer import build_price_chart, build_indicator_chart
 from btc_investor_tui.macro_intel import get_macro_intel
 
@@ -42,7 +44,7 @@ class PlotCanvas(Static):
         self._data: Payload | None = None
         self._timeframe = "weekly"
         self._indicator = "rsi"
-        self._ai_zones: Payload | None = None
+        self._order_blocks: Payload | None = None
         self._ema_fast_on = True
         self._ema_slow_on = True
         self._ema_fast_p = 20
@@ -55,7 +57,7 @@ class PlotCanvas(Static):
         data: Payload | None,
         timeframe: str,
         indicator: str,
-        ai_zones: Payload | None = None,
+        order_blocks: Payload | None = None,
         ema_fast_on: bool = True,
         ema_slow_on: bool = True,
         ema_fast_p: int = 20,
@@ -66,7 +68,7 @@ class PlotCanvas(Static):
         self._data = data
         self._timeframe = timeframe
         self._indicator = indicator
-        self._ai_zones = ai_zones
+        self._order_blocks = order_blocks
         self._ema_fast_on = ema_fast_on
         self._ema_slow_on = ema_slow_on
         self._ema_fast_p = ema_fast_p
@@ -103,20 +105,47 @@ class PlotCanvas(Static):
             height = max(14, self.size.height - 1)
             txt = build_price_chart(
                 candles, technical, self._timeframe, width, height,
-                self._ai_zones, self._ema_fast_on, self._ema_slow_on,
+                self._order_blocks, self._ema_fast_on, self._ema_slow_on,
                 self._ema_fast_p, self._ema_slow_p,
             )
         self.update(Text.from_ansi(txt))
+
+
+class NewsPanel(Static):
+    """Clickable news panel that opens article links in the default browser."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__("", **kwargs)
+        self._line_links: list[str | None] = []
+
+    def update_feed(self, text: Text, line_links: list[str | None]) -> None:
+        self._line_links = line_links
+        self.update(text)
+
+    def on_click(self, event: Click) -> None:
+        url = _link_from_click(event, self)
+        if not url:
+            return
+        event.stop()
+        if webbrowser.open(url, new=2):
+            self.app.notify(f"Opened: {url}", title="News")
+        else:
+            self.app.notify(f"Could not open browser for: {url}", title="News", severity="warning")
+
+    def link_at_line(self, line_index: int) -> str | None:
+        if 0 <= line_index < len(self._line_links):
+            return self._line_links[line_index]
+        return None
 
 
 class BTCInvestorApp(App[None]):
     """Bloomberg-style BTC investor terminal with dynamic indicators."""
 
     TITLE = "BTC INVESTOR TERMINAL"
-    SUB_TITLE = "BTC-USDT · Dynamic Indicators · AI Zones · Macro Intel"
+    SUB_TITLE = "BTC-USDT · Dynamic Indicators · Order Blocks · Macro Intel"
     BINDINGS = [
         ("r", "refresh", "Refresh"),
-        ("a", "ai_refresh", "AI"),
+        ("a", "ai_refresh", "AI Notes"),
         ("p", "toggle_settings", "Settings"),
         ("w", "weekly", "1W"),
         ("d", "daily", "1D"),
@@ -165,7 +194,7 @@ class BTCInvestorApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.dashboard_data: Payload | None = None
-        self.ai_zones_data: dict[str, Payload] = {}
+        self.ai_commentary_data: dict[str, Payload] = {}
         self.macro_data: Payload | None = None
         self.selected_timeframe = "weekly"
         self.selected_indicator = "rsi"
@@ -202,7 +231,7 @@ class BTCInvestorApp(App[None]):
             yield Static("", id="ai-analysis")
             yield Static("", id="macro-intel")
             yield Static("", id="market-summary", classes="panel")
-            yield Static("", id="news-section", classes="panel")
+            yield NewsPanel(id="news-section", classes="panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -218,7 +247,7 @@ class BTCInvestorApp(App[None]):
         if not _get_token():
             self._show_pat_input()
             return
-        self._start_ai_analysis()
+        self._start_ai_commentary()
 
     def action_toggle_settings(self) -> None:
         panel = self.query_one("#settings-panel")
@@ -256,7 +285,9 @@ class BTCInvestorApp(App[None]):
                 save_token(token)
                 self._update_status("Token saved permanently")
             event.input.remove()
-            self._start_ai_analysis()
+            self._start_ai_commentary()
+            return
+        if event.input.id is None:
             return
         self._apply_settings_input(event.input.id, event.value)
 
@@ -366,21 +397,23 @@ class BTCInvestorApp(App[None]):
 
         self.run_worker(fetch, name="refresh", group="refresh", exclusive=True, thread=True, exit_on_error=False)
 
-    def _start_ai_analysis(self) -> None:
+    def _start_ai_commentary(self) -> None:
         if not self.dashboard_data:
             return
-        self._update_status("Fetching AI zones...")
+        self._update_status("Fetching AI order block commentary...")
         tf = self.selected_timeframe
+        data = self.dashboard_data
 
         def fetch_ai() -> None:
             worker = get_current_worker()
-            section = self.dashboard_data.get(tf)
+            section = data.get(tf)
             candles = section.get("candles", []) if isinstance(section, dict) else []
+            order_blocks = section.get("order_blocks", {}) if isinstance(section, dict) else {}
             if not candles:
                 return
-            zones = get_ai_zones(candles, "1W" if tf == "weekly" else "1D")
+            commentary = get_order_block_commentary(candles, "1W" if tf == "weekly" else "1D", order_blocks)
             if not worker.is_cancelled:
-                self.call_from_thread(self._ai_zones_received, tf, zones)
+                self.call_from_thread(self._ai_commentary_received, tf, commentary)
 
         self.run_worker(fetch_ai, name="ai", group="ai", exclusive=True, thread=True, exit_on_error=False)
 
@@ -389,8 +422,9 @@ class BTCInvestorApp(App[None]):
         def fetch_macro() -> None:
             worker = get_current_worker()
             weekly_closes = None
-            if self.dashboard_data:
-                section = self.dashboard_data.get("weekly")
+            data = self.dashboard_data
+            if data:
+                section = data.get("weekly")
                 if isinstance(section, dict):
                     candles = section.get("candles", [])
                     weekly_closes = [c["close"] for c in candles if "close" in c]
@@ -409,8 +443,8 @@ class BTCInvestorApp(App[None]):
 
         self.run_worker(fetch_macro, name="macro", group="macro", exclusive=True, thread=True, exit_on_error=False)
 
-    def _ai_zones_received(self, timeframe: str, zones: Payload) -> None:
-        self.ai_zones_data[timeframe] = zones
+    def _ai_commentary_received(self, timeframe: str, commentary: Payload) -> None:
+        self.ai_commentary_data[timeframe] = commentary
         self._render_dashboard()
 
     def _macro_received(self, data: Payload) -> None:
@@ -421,7 +455,8 @@ class BTCInvestorApp(App[None]):
         self.dashboard_data = data
         self.last_error = None
         self._render_dashboard()
-        self._start_ai_analysis()
+        if _get_token():
+            self._start_ai_commentary()
         self._start_macro_fetch()
 
     def _refresh_failed(self, message: str) -> None:
@@ -440,10 +475,15 @@ class BTCInvestorApp(App[None]):
         self._render_status()
 
     def _render_plots(self) -> None:
-        zones = self.ai_zones_data.get(self.selected_timeframe)
+        order_blocks: Payload | None = None
+        if self.dashboard_data:
+            section = self.dashboard_data.get(self.selected_timeframe)
+            if isinstance(section, dict):
+                blocks = section.get("order_blocks")
+                order_blocks = blocks if isinstance(blocks, dict) else None
         self.query_one("#price-chart", PlotCanvas).set_state(
             self.dashboard_data, self.selected_timeframe, self.selected_indicator,
-            zones, self.show_ema_fast, self.show_ema_slow,
+            order_blocks, self.show_ema_fast, self.show_ema_slow,
             self.ema_fast_period, self.ema_slow_period,
         )
         # RSI chart
@@ -480,18 +520,33 @@ class BTCInvestorApp(App[None]):
 
     def _render_ai_analysis(self) -> None:
         panel = self.query_one("#ai-analysis", Static)
-        zones = self.ai_zones_data.get(self.selected_timeframe)
-        if not zones:
-            panel.update("[bold #ff8c00]═══ AI ZONES ═══[/]\n[#666666]Press A for AI buy/sell zones[/]")
+        if not self.dashboard_data:
+            panel.update("[bold #ff8c00]═══ ORDER BLOCKS ═══[/]\n[#666666]Waiting...[/]")
             return
-        lines = ["[bold #ff8c00]═══ AI ZONES ═══[/]"]
-        for z in zones.get("buy_zones", []):
-            lines.append(f"  [#00ff88]█ BUY[/]  {_fmt_usd(z.get('price_low'))} - {_fmt_usd(z.get('price_high'))}  [#666]{escape(z.get('label',''))}[/]")
-        for z in zones.get("sell_zones", []):
-            lines.append(f"  [#ff4444]█ SELL[/] {_fmt_usd(z.get('price_low'))} - {_fmt_usd(z.get('price_high'))}  [#666]{escape(z.get('label',''))}[/]")
-        analysis = zones.get("analysis", "")
+        section = self.dashboard_data.get(self.selected_timeframe)
+        blocks = section.get("order_blocks", {}) if isinstance(section, dict) else {}
+        if not isinstance(blocks, dict):
+            blocks = {}
+        commentary = self.ai_commentary_data.get(self.selected_timeframe, {})
+        lines = ["[bold #ff8c00]═══ ORDER BLOCKS / AI COMMENTARY ═══[/]"]
+        unmitigated = blocks.get("unmitigated") if isinstance(blocks.get("unmitigated"), list) else []
+        if unmitigated:
+            for block in unmitigated[:6]:
+                if not isinstance(block, dict):
+                    continue
+                color = "#00ff88" if block.get("type") == "bullish" else "#ff4444"
+                side = "DEMAND" if block.get("type") == "bullish" else "SUPPLY"
+                label = escape(str(block.get("origin_date") or ""))
+                lines.append(f"  [{color}]█ {side}[/] {_fmt_usd(block.get('price_low'))} - {_fmt_usd(block.get('price_high'))}  [#666]{label}[/]")
+        else:
+            lines.append("[#666666]No recent unmitigated order blocks detected.[/]")
+        analysis = commentary.get("analysis", "") if isinstance(commentary, dict) else ""
         if analysis:
             lines.append(f"[#cccccc]{escape(analysis)}[/]")
+        elif _get_token():
+            lines.append("[#666666]Press A to refresh AI commentary about these blocks.[/]")
+        else:
+            lines.append("[#666666]Press A to add a token and enable AI commentary.[/]")
         panel.update("\n".join(lines))
 
     def _render_macro(self) -> None:
@@ -547,9 +602,10 @@ class BTCInvestorApp(App[None]):
         panel.update("\n".join(lines))
 
     def _render_feed(self) -> None:
-        feed = self.query_one("#news-section", Static)
+        feed = self.query_one("#news-section", NewsPanel)
         if not self.dashboard_data:
-            feed.update("[bold #ff8c00]NEWS[/]\n[#666666]Waiting...[/]")
+            text = Text.from_markup("[bold #ff8c00]NEWS[/]\n[#666666]Waiting...[/]")
+            feed.update_feed(text, [None, None])
             return
         news = self.dashboard_data.get("news") or {}
         items = news.get("items", []) if isinstance(news, dict) else []
@@ -557,28 +613,34 @@ class BTCInvestorApp(App[None]):
         posts = sentiment.get("top_posts", []) if isinstance(sentiment, dict) else []
 
         text = Text()
+        line_links: list[str | None] = []
         text.append("═══ NEWS ═══\n", style="bold #ff8c00")
+        line_links.append(None)
         for i, item in enumerate(items[:6], 1):
             if not isinstance(item, dict):
                 continue
-            title = str(item.get("title") or "")
+            title = _shorten(str(item.get("title") or ""), 110)
             url = str(item.get("url") or "")
             text.append(f" {i} ", style="bold #ffffff")
             text.append(f"{title}\n", style=f"underline link {url}" if url.startswith("http") else "")
+            line_links.append(url if url.startswith("http") else None)
 
         if posts:
             text.append("\n═══ REDDIT ═══\n", style="bold #ff8c00")
+            line_links.extend([None, None])
             for post in posts[:3]:
                 if not isinstance(post, dict):
                     continue
                 title = _shorten(str(post.get("title") or ""), 80)
                 url = str(post.get("url") or "")
                 text.append(f" {title}\n", style=f"underline link {url}" if url.startswith("http") else "")
+                line_links.append(url if url.startswith("http") else None)
 
         if not items and not posts:
             text.append("No news available\n", style="#666666")
+            line_links.append(None)
 
-        feed.update(text)
+        feed.update_feed(text, line_links)
 
     def _render_status(self) -> None:
         if self.last_error:
@@ -638,6 +700,16 @@ def _fmt_label(v: Any) -> str:
 def _shorten(s: str, limit: int) -> str:
     t = " ".join(s.split())
     return t if len(t) <= limit else f"{t[:limit-3].rstrip()}..."
+
+
+def _link_from_click(event: Click, panel: NewsPanel) -> str | None:
+    style = event.style
+    if style is not None and style.link and style.link.startswith("http"):
+        return style.link
+    offset = event.get_content_offset(panel)
+    if offset is None:
+        return None
+    return panel.link_at_line(offset.y)
 
 
 def main() -> None:

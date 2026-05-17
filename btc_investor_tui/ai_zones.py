@@ -1,8 +1,9 @@
-"""AI-powered buy/sell zone analysis via GitHub Models API."""
+"""AI commentary for deterministic BTC order blocks via GitHub Models API."""
 
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import urllib.request
 from pathlib import Path
@@ -18,7 +19,7 @@ def _get_token() -> str:
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PAT") or ""
     if not token:
         try:
-            from dotenv import load_dotenv
+            load_dotenv = importlib.import_module("dotenv").load_dotenv
             load_dotenv()
             token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PAT") or ""
         except ImportError:
@@ -34,44 +35,46 @@ def save_token(token: str) -> None:
     os.environ["GITHUB_TOKEN"] = token
 
 
-def get_ai_zones(candles: list[dict[str, Any]], timeframe: str) -> dict[str, Any]:
-    """Call GitHub Models API to get buy/sell zones based on candle data.
-
-    Returns dict with keys: buy_zones, sell_zones, analysis
-    Each zone: {start_idx, end_idx, price_low, price_high}
-    """
+def get_order_block_commentary(
+    candles: list[dict[str, Any]],
+    timeframe: str,
+    order_blocks: dict[str, Any],
+) -> dict[str, Any]:
+    """Return AI commentary about deterministic order blocks only."""
     token = _get_token()
     if not token:
         return {
             "buy_zones": [],
             "sell_zones": [],
-            "analysis": "⚠ Set GITHUB_TOKEN env var with models:read scope to enable AI zone analysis.",
+            "analysis": "⚠ Set GITHUB_TOKEN env var with models:read scope to enable AI order block commentary.",
+            "commentary": "",
         }
 
-    # Send last 60 candles for context
     recent = candles[-60:] if len(candles) > 60 else candles
     candle_summary = [
         {"d": c["date"], "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]}
         for c in recent
     ]
+    block_summary = _summarize_order_blocks(order_blocks)
 
-    prompt = f"""You are a professional spot trading analyst. Analyze these BTC-USD {timeframe} candles and identify buy zones and sell zones.
+    prompt = f"""You are a professional spot BTC market analyst. The order blocks below were detected locally by deterministic volume-pivot logic. Do not invent, alter, add, or remove zones.
 
 Rules:
 - Spot trading only (no leverage/shorts)
-- Buy zones: price ranges where accumulation is favorable (support, oversold, demand zones)
-- Sell zones: price ranges where taking profit is favorable (resistance, overbought, supply zones)
-- Use the LAST 60 candles context, but zones should be relevant to CURRENT price action
-- Return 1-3 buy zones and 1-3 sell zones
+- Discuss only the provided deterministic BTC-USD {timeframe} order blocks
+- Prefer recent unmitigated blocks when describing relevance
+- Mention mitigation status plainly when useful
+- Do not output buy_zones or sell_zones with entries
 
 Candles (date, open, high, low, close):
 {json.dumps(candle_summary)}
 
+Deterministic order blocks:
+{json.dumps(block_summary)}
+
 Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
 {{
-  "buy_zones": [{{"price_low": number, "price_high": number, "label": "short reason"}}],
-  "sell_zones": [{{"price_low": number, "price_high": number, "label": "short reason"}}],
-  "analysis": "2-4 sentences explaining your reasoning for these zones"
+  "analysis": "2-4 sentences commenting on the provided deterministic order blocks"
 }}"""
 
     payload = {
@@ -104,14 +107,51 @@ Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
                 content = content[:-3]
             content = content.strip()
         result = json.loads(content)
+        analysis = str(result.get("analysis", "No commentary provided."))
         return {
-            "buy_zones": result.get("buy_zones", []),
-            "sell_zones": result.get("sell_zones", []),
-            "analysis": result.get("analysis", "No analysis provided."),
+            "buy_zones": [],
+            "sell_zones": [],
+            "analysis": analysis,
+            "commentary": analysis,
         }
     except Exception as e:
         return {
             "buy_zones": [],
             "sell_zones": [],
-            "analysis": f"AI analysis error: {type(e).__name__}: {e}",
+            "analysis": f"AI commentary error: {type(e).__name__}: {e}",
+            "commentary": "",
         }
+
+
+def get_ai_zones(candles: list[dict[str, Any]], timeframe: str) -> dict[str, Any]:
+    """Compatibility wrapper: AI no longer invents buy/sell zones."""
+    return get_order_block_commentary(candles, timeframe, {"unmitigated": [], "recent": []})
+
+
+def _summarize_order_blocks(order_blocks: dict[str, Any]) -> dict[str, Any]:
+    def summarize(blocks: Any) -> list[dict[str, Any]]:
+        if not isinstance(blocks, list):
+            return []
+        summary: list[dict[str, Any]] = []
+        for block in blocks[:8]:
+            if not isinstance(block, dict):
+                continue
+            summary.append(
+                {
+                    "type": block.get("type"),
+                    "price_low": block.get("price_low"),
+                    "price_high": block.get("price_high"),
+                    "origin_date": block.get("origin_date"),
+                    "created_date": block.get("created_date"),
+                    "mitigated": block.get("mitigated"),
+                    "mitigated_date": block.get("mitigated_date"),
+                    "volume": block.get("volume"),
+                }
+            )
+        return summary
+
+    return {
+        "mitigation_mode": order_blocks.get("mitigation_mode"),
+        "unmitigated": summarize(order_blocks.get("unmitigated")),
+        "recent": summarize(order_blocks.get("recent")),
+    }

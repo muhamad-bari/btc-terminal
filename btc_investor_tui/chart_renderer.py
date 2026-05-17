@@ -18,9 +18,10 @@ _GREEN = "green"         # candle up
 _RED = "red"             # candle down
 _YELLOW = "yellow"       # EMA20
 _CYAN = "cyan"           # EMA50
-_ZONE_BUY = "green"     # buy zone band
-_ZONE_SELL = "red"      # sell zone band
+_ZONE_BUY = "green"     # demand order block band
+_ZONE_SELL = "red"      # supply order block band
 _GRID = "white"          # grid/reference lines
+_MAX_VISIBLE_ORDER_BLOCKS = 6
 
 
 def _as_float(value: Any) -> float | None:
@@ -73,13 +74,13 @@ def build_price_chart(
     timeframe: str,
     width: int,
     height: int,
-    ai_zones: Payload | None = None,
+    order_blocks: Payload | None = None,
     show_ema_fast: bool = True,
     show_ema_slow: bool = True,
     ema_fast_period: int = 20,
     ema_slow_period: int = 50,
 ) -> str:
-    """Render candlestick chart with EMA overlays and AI zones using plotille Canvas."""
+    """Render candlestick chart with EMA overlays and deterministic order blocks."""
     max_points = min(len(candles), max(40, width // 2))
     rows = _slice_candles(candles, technical, max_points)
     n = len(rows["close"])
@@ -101,19 +102,7 @@ def build_price_chart(
     c = plotille.Canvas(width=canvas_w, height=canvas_h,
                         xmin=0, xmax=n, ymin=ymin, ymax=ymax)
 
-    # Draw AI zone bands first (background)
-    if ai_zones:
-        for zone in (ai_zones.get("buy_zones") or []):
-            zl = _as_float(zone.get("price_low"))
-            zh = _as_float(zone.get("price_high"))
-            if zl is not None and zh is not None and zh > ymin and zl < ymax:
-                # Draw horizontal band as filled rect
-                c.rect(0, max(ymin, zl), n, min(ymax, zh), color=_ZONE_BUY)
-        for zone in (ai_zones.get("sell_zones") or []):
-            zl = _as_float(zone.get("price_low"))
-            zh = _as_float(zone.get("price_high"))
-            if zl is not None and zh is not None and zh > ymin and zl < ymax:
-                c.rect(0, max(ymin, zl), n, min(ymax, zh), color=_ZONE_SELL)
+    _draw_order_block_bands(c, order_blocks, len(candles) - n, n, ymin, ymax)
 
     # Draw candlesticks: wick (line) + body (rect)
     for i in range(n):
@@ -147,6 +136,9 @@ def build_price_chart(
         legend_parts.append(f"\033[38;2;255;200;50m─ EMA{ema_fast_period}\033[0m")
     if show_ema_slow:
         legend_parts.append(f"\033[38;2;100;200;255m─ EMA{ema_slow_period}\033[0m")
+    if order_blocks and order_blocks.get("unmitigated"):
+        legend_parts.append("\033[38;2;38;166;91m▌ Demand OB\033[0m")
+        legend_parts.append("\033[38;2;239;57;74m▌ Supply OB\033[0m")
     title = f"  BTC-USDT {tf_label} │ {' '.join(legend_parts)}"
 
     canvas_lines = c.plot().split("\n")
@@ -170,7 +162,33 @@ def build_price_chart(
     return "\n".join(output_lines)
 
 
-def _draw_series_line(canvas: plotille.Canvas, values: list, color: tuple) -> None:
+def _draw_order_block_bands(
+    canvas: plotille.Canvas,
+    order_blocks: Payload | None,
+    visible_start: int,
+    visible_count: int,
+    ymin: float,
+    ymax: float,
+) -> None:
+    if not order_blocks:
+        return
+    blocks = order_blocks.get("unmitigated")
+    if not isinstance(blocks, list):
+        return
+    for block in blocks[:_MAX_VISIBLE_ORDER_BLOCKS]:
+        if not isinstance(block, dict) or block.get("mitigated"):
+            continue
+        price_low = _as_float(block.get("price_low"))
+        price_high = _as_float(block.get("price_high"))
+        if price_low is None or price_high is None or price_high <= ymin or price_low >= ymax:
+            continue
+        origin_index = _as_float(block.get("origin_index"))
+        start_x = 0 if origin_index is None else max(0, int(origin_index) - visible_start)
+        color = _ZONE_BUY if block.get("type") == "bullish" else _ZONE_SELL
+        canvas.rect(start_x, max(ymin, price_low), visible_count, min(ymax, price_high), color=color)
+
+
+def _draw_series_line(canvas: plotille.Canvas, values: list, color: str) -> None:
     """Draw a smooth line connecting non-None values."""
     prev_x: float | None = None
     prev_y: float | None = None
@@ -297,5 +315,3 @@ def _build_macd(rows: dict, n: int, canvas_w: int, canvas_h: int, tf_label: str)
 
     output_lines.append(f"{'':>9} └{'─' * canvas_w}")
     return "\n".join(output_lines)
-
-

@@ -54,6 +54,9 @@ DEFAULT_DAILY_PERIOD = "2y"
 DEFAULT_WEEKLY_PERIOD = "5y"
 DEFAULT_DAILY_INTERVAL = "1d"
 DEFAULT_WEEKLY_INTERVAL = "1wk"
+DEFAULT_ORDER_BLOCK_PIVOT_LEFT = 2
+DEFAULT_ORDER_BLOCK_PIVOT_RIGHT = 2
+DEFAULT_ORDER_BLOCK_LIMIT = 8
 
 _NEWS_USER_AGENT = (
     "Mozilla/5.0 (compatible; btc-investor-tui/0.1; "
@@ -248,6 +251,47 @@ def recalculate_indicators(
     }
 
 
+def detect_order_blocks(
+    candles: list[dict[str, Any]],
+    *,
+    pivot_left: int = DEFAULT_ORDER_BLOCK_PIVOT_LEFT,
+    pivot_right: int = DEFAULT_ORDER_BLOCK_PIVOT_RIGHT,
+    mitigation: str = "wick",
+    max_blocks: int = DEFAULT_ORDER_BLOCK_LIMIT,
+) -> dict[str, Any]:
+    """Detect deterministic volume-pivot BTC order blocks.
+
+    A bearish volume-pivot candle followed by a break above its high becomes a
+    bullish demand block. A bullish volume-pivot candle followed by a break
+    below its low becomes a bearish supply block. Mitigation is evaluated after
+    the confirming break using either wick or close interaction with the block.
+    """
+    if pivot_left < 1 or pivot_right < 1:
+        raise ValueError("pivot_left and pivot_right must be >= 1")
+    if mitigation not in {"wick", "close"}:
+        raise ValueError("mitigation must be 'wick' or 'close'")
+
+    blocks: list[dict[str, Any]] = []
+    if len(candles) < pivot_left + pivot_right + 2:
+        return _order_block_payload(blocks, mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
+
+    for index in range(pivot_left, len(candles) - pivot_right):
+        pivot = _normalized_order_block_candle(candles[index], index)
+        if pivot is None or not _is_volume_pivot(candles, index, pivot_left, pivot_right):
+            continue
+
+        if pivot["close"] < pivot["open"]:
+            confirmation = _find_bullish_confirmation(candles, index, pivot_right)
+            if confirmation is not None:
+                blocks.append(_build_order_block(candles, pivot, confirmation, "bullish", mitigation))
+        elif pivot["close"] > pivot["open"]:
+            confirmation = _find_bearish_confirmation(candles, index, pivot_right)
+            if confirmation is not None:
+                blocks.append(_build_order_block(candles, pivot, confirmation, "bearish", mitigation))
+
+    return _order_block_payload(blocks, mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
+
+
 def get_btc_news(limit: int = 12) -> dict[str, Any]:
     """Return BTC-focused crypto/macro RSS news with a stdlib fallback parser."""
     primary = fetch_news_summary(symbol="BTC", category="all", limit=limit)
@@ -307,6 +351,8 @@ def get_btc_dashboard_data(
         daily_candles = get_btc_candles(period=daily_period, interval=DEFAULT_DAILY_INTERVAL)
         weekly_technical = build_btc_technical_snapshot(weekly_candles)
         daily_technical = build_btc_technical_snapshot(daily_candles)
+        weekly_order_blocks = detect_order_blocks(weekly_candles)
+        daily_order_blocks = detect_order_blocks(daily_candles)
 
         quote = _safe_fetch(
             "quote",
@@ -339,8 +385,8 @@ def get_btc_dashboard_data(
             "default_timeframes": {"primary": "1W", "secondary": "1D"},
             "quote": quote,
             "market_summary": _build_market_summary(quote, weekly_technical),
-            "weekly": {"candles": weekly_candles, "technical": weekly_technical},
-            "daily": {"candles": daily_candles, "technical": daily_technical},
+            "weekly": {"candles": weekly_candles, "technical": weekly_technical, "order_blocks": weekly_order_blocks},
+            "daily": {"candles": daily_candles, "technical": daily_technical, "order_blocks": daily_order_blocks},
             "news": news,
             "reddit_sentiment": reddit_sentiment,
             "macro_pulse": macro_pulse,
@@ -402,6 +448,147 @@ def calculate_dynamic_indicators(
         result["stoch_k"] = stoch.stoch()
         result["stoch_d"] = stoch.stoch_signal()
     return result
+
+
+def _normalized_order_block_candle(candle: dict[str, Any], index: int) -> dict[str, Any] | None:
+    open_price = _finite_float(candle.get("open"))
+    high_price = _finite_float(candle.get("high"))
+    low_price = _finite_float(candle.get("low"))
+    close_price = _finite_float(candle.get("close"))
+    volume = _finite_float(candle.get("volume"))
+    if open_price is None or high_price is None or low_price is None or close_price is None or volume is None:
+        return None
+    if volume <= 0 or high_price < low_price:
+        return None
+    return {
+        "index": index,
+        "date": str(candle.get("date", "")),
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "volume": volume,
+    }
+
+
+def _is_volume_pivot(candles: list[dict[str, Any]], index: int, left: int, right: int) -> bool:
+    pivot_volume = _finite_float(candles[index].get("volume"))
+    if pivot_volume is None or pivot_volume <= 0:
+        return False
+    start = index - left
+    end = index + right + 1
+    for other_index in range(start, end):
+        if other_index == index:
+            continue
+        other_volume = _finite_float(candles[other_index].get("volume"))
+        if other_volume is not None and other_volume >= pivot_volume:
+            return False
+    return True
+
+
+def _find_bullish_confirmation(candles: list[dict[str, Any]], index: int, pivot_right: int) -> int | None:
+    pivot_high = _finite_float(candles[index].get("high"))
+    if pivot_high is None:
+        return None
+    end = min(len(candles), index + pivot_right + 4)
+    for confirm_index in range(index + 1, end):
+        close_price = _finite_float(candles[confirm_index].get("close"))
+        if close_price is not None and close_price > pivot_high:
+            return confirm_index
+    return None
+
+
+def _find_bearish_confirmation(candles: list[dict[str, Any]], index: int, pivot_right: int) -> int | None:
+    pivot_low = _finite_float(candles[index].get("low"))
+    if pivot_low is None:
+        return None
+    end = min(len(candles), index + pivot_right + 4)
+    for confirm_index in range(index + 1, end):
+        close_price = _finite_float(candles[confirm_index].get("close"))
+        if close_price is not None and close_price < pivot_low:
+            return confirm_index
+    return None
+
+
+def _build_order_block(
+    candles: list[dict[str, Any]],
+    pivot: dict[str, Any],
+    confirmation_index: int,
+    block_type: str,
+    mitigation: str,
+) -> dict[str, Any]:
+    if block_type == "bullish":
+        price_low = min(pivot["low"], pivot["open"], pivot["close"])
+        price_high = max(pivot["open"], pivot["close"])
+        label = "Bullish volume-pivot demand block"
+    else:
+        price_low = min(pivot["open"], pivot["close"])
+        price_high = max(pivot["high"], pivot["open"], pivot["close"])
+        label = "Bearish volume-pivot supply block"
+
+    mitigated_index = _find_mitigation_index(candles, confirmation_index + 1, block_type, price_low, price_high, mitigation)
+    return {
+        "type": block_type,
+        "price_low": _round_price(price_low),
+        "price_high": _round_price(price_high),
+        "origin_index": pivot["index"],
+        "origin_date": pivot["date"],
+        "created_index": confirmation_index,
+        "created_date": str(candles[confirmation_index].get("date", "")),
+        "volume": int(pivot["volume"]),
+        "mitigated": mitigated_index is not None,
+        "mitigated_index": mitigated_index,
+        "mitigated_date": str(candles[mitigated_index].get("date", "")) if mitigated_index is not None else None,
+        "mitigation_mode": mitigation,
+        "label": label,
+    }
+
+
+def _find_mitigation_index(
+    candles: list[dict[str, Any]],
+    start_index: int,
+    block_type: str,
+    price_low: float,
+    price_high: float,
+    mitigation: str,
+) -> int | None:
+    for index in range(start_index, len(candles)):
+        candle = candles[index]
+        high_price = _finite_float(candle.get("high"))
+        low_price = _finite_float(candle.get("low"))
+        close_price = _finite_float(candle.get("close"))
+        if block_type == "bullish":
+            test_price = close_price if mitigation == "close" else low_price
+            if test_price is not None and test_price <= price_high:
+                return index
+        else:
+            test_price = close_price if mitigation == "close" else high_price
+            if test_price is not None and test_price >= price_low:
+                return index
+    return None
+
+
+def _order_block_payload(
+    blocks: list[dict[str, Any]],
+    *,
+    mitigation: str,
+    pivot_left: int,
+    pivot_right: int,
+    max_blocks: int,
+) -> dict[str, Any]:
+    recent = sorted(blocks, key=lambda block: int(block.get("origin_index", 0)), reverse=True)
+    unmitigated = [block for block in recent if not block.get("mitigated")]
+    bullish = [block for block in recent if block.get("type") == "bullish"]
+    bearish = [block for block in recent if block.get("type") == "bearish"]
+    return {
+        "mitigation_mode": mitigation,
+        "pivot_left": pivot_left,
+        "pivot_right": pivot_right,
+        "bullish": bullish[:max_blocks],
+        "bearish": bearish[:max_blocks],
+        "recent": recent[:max_blocks],
+        "unmitigated": unmitigated[:max_blocks],
+    }
 
 
 def _build_market_summary(quote: dict[str, Any], weekly_technical: dict[str, Any]) -> dict[str, Any]:
