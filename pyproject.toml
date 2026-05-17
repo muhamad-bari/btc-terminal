@@ -15,17 +15,26 @@ classifiers = [
 ]
 dependencies = [
   "feedparser>=6.0.12",
+  "matplotlib>=3.10.0",
   "mcp[cli]>=1.12.0",
+  "pandas>=2.3.0",
+  "pillow>=12.0.0",
+  "ta>=0.11.0",
+  "textual>=6.0.0",
+  "textual-image>=0.12.0",
   "tradingview-screener>=0.6.4",
   "tradingview-ta>=3.3.0",
+  "yfinance>=0.2.66",
 ]
 
 [project.scripts]
 # Entry point now points to packaged module
 tradingview-mcp = "tradingview_mcp.server:main"
+btc-tui = "btc_investor_tui.app:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["tradingview_mcp*", "btc_investor_tui*"]
 
 [tool.setuptools.package-data]
 tradingview_mcp = ["coinlist/*.txt"]
@@ -34,6 +43,8 @@ tradingview_mcp = ["coinlist/*.txt"]
 dev = [
     "pytest>=9.0.3",
 ]
+
+[tool.uv]
 package = true
 
 [build-system]

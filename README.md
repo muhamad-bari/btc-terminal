@@ -54,13 +54,36 @@ Bloomberg-style Bitcoin terminal dashboard untuk investor, dibangun dengan Pytho
 git clone https://github.com/user/btc-investor-tui.git
 cd btc-investor-tui
 
-# Setup (requires Python 3.12+ dan uv)
+# Setup lokal development (requires Python 3.12+ dan uv)
 uv venv
 uv pip install -e .
 
 # Run
-./.venv/bin/python btc_investor_tui/app.py
+btc-tui
 ```
+
+Setelah `uv pip install -e .`, command `btc-tui` tersedia di virtualenv project (`.venv/bin/btc-tui`). Kalau shell belum otomatis memakai `.venv/bin`, jalankan salah satu:
+
+```bash
+source .venv/bin/activate
+btc-tui
+
+# atau tanpa activate
+./.venv/bin/btc-tui
+```
+
+### Install sebagai command global
+
+Jika ingin bisa mengetik `btc-tui` dari terminal mana saja setelah pindah PC/install baru:
+
+```bash
+git clone https://github.com/user/btc-investor-tui.git
+cd btc-investor-tui
+uv tool install .
+btc-tui
+```
+
+Pastikan folder binary `uv tool` sudah ada di `PATH`. Jika belum, jalankan `uv tool update-shell` lalu buka terminal baru.
 
 ## AI Zones Setup
 
