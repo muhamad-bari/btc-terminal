@@ -8,6 +8,8 @@ from __future__ import annotations
 import math
 import sys
 import webbrowser
+import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +19,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Click
 from textual.reactive import reactive
-from textual.widgets import Checkbox, Footer, Header, Input, Static
+from textual.widgets import Checkbox, Footer, Header, Input, RichLog, Static
 from textual.worker import get_current_worker
 
 if __package__ in (None, ""):
@@ -28,9 +30,57 @@ if __package__ in (None, ""):
 from btc_investor_tui.data_engine import get_btc_dashboard_data, recalculate_indicators
 from btc_investor_tui.ai_zones import get_order_block_commentary, _get_token, save_token
 from btc_investor_tui.macro_intel import get_macro_intel
-from btc_investor_tui.pixel_chart import ImageChartCanvas
+from btc_investor_tui.pixel_chart import ImageChartCanvas, build_dashboard_png
 
 Payload = dict[str, Any]
+
+
+@dataclass
+class BootResult:
+    dashboard_data: Payload | None = None
+    macro_data: Payload | None = None
+    chart_png: bytes | None = None
+    errors: list[str] = field(default_factory=list)
+
+
+class BootPanel(Vertical):
+    """TTY-style startup screen that streams boot status lines."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("BTC INVESTOR TERMINAL", id="boot-title")
+        yield RichLog(id="boot-log", markup=True, wrap=True, highlight=False)
+
+
+class DashboardBody(VerticalScroll):
+    """Main dashboard layout mounted after the boot sequence finishes."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="chart-title", classes="ptitle")
+        yield Static("Starting...", id="status-strip")
+        with Vertical(id="settings-panel"):
+            yield Static("[bold #ff8c00]═══ INDICATOR SETTINGS ═══[/]")
+            with Horizontal(classes="settings-row"):
+                yield Checkbox("EMA Fast", value=True, id="chk-ema-fast")
+                yield Input(value="20", id="inp-ema-fast", placeholder="20")
+                yield Checkbox("EMA Slow", value=True, id="chk-ema-slow")
+                yield Input(value="50", id="inp-ema-slow", placeholder="50")
+            with Horizontal(classes="settings-row"):
+                yield Checkbox("RSI", value=True, id="chk-rsi")
+                yield Input(value="14", id="inp-rsi", placeholder="14")
+                yield Checkbox("Stoch", value=True, id="chk-stoch")
+                yield Input(value="5", id="inp-stoch-k", placeholder="K")
+                yield Input(value="3", id="inp-stoch-d", placeholder="D")
+                yield Input(value="3", id="inp-stoch-smooth", placeholder="Sm")
+            with Horizontal(classes="settings-row"):
+                yield Static(" MACD (F/S/Sig):")
+                yield Input(value="12", id="inp-macd-fast", placeholder="12")
+                yield Input(value="26", id="inp-macd-slow", placeholder="26")
+                yield Input(value="9", id="inp-macd-sig", placeholder="9")
+        yield ImageChartCanvas(id="price-chart")
+        yield Static("", id="ai-analysis")
+        yield Static("", id="macro-intel")
+        yield Static("", id="market-summary", classes="panel")
+        yield NewsPanel(id="news-section", classes="panel")
 
 
 class NewsPanel(Static):
@@ -79,6 +129,10 @@ class BTCInvestorApp(App[None]):
     Screen { background: #000000; color: #e0e0e0; }
     Header { background: #1a1a1a; color: #ff8c00; }
     Footer { background: #1a1a1a; color: #999999; }
+    #app-body { background: #000000; }
+    #boot-panel { background: #000000; padding: 1 2; }
+    #boot-title { height: 3; color: #ff8c00; text-style: bold; }
+    #boot-log { height: 1fr; background: #000000; color: #e0e0e0; border: none; }
     #main-scroll { background: #000000; }
     .ptitle { height: 3; padding: 0 1; border: solid #333333; background: #0a0a0a; color: #ff8c00; }
     .panel { border: solid #333333; background: #0a0a0a; color: #e0e0e0; padding: 1; }
@@ -116,45 +170,168 @@ class BTCInvestorApp(App[None]):
         self.dashboard_data: Payload | None = None
         self.ai_commentary_data: dict[str, Payload] = {}
         self.macro_data: Payload | None = None
+        self.boot_chart_png: bytes | None = None
         self.selected_timeframe = "weekly"
         self.selected_indicator = "rsi"
         self.last_error: str | None = None
+        self.boot_complete = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with VerticalScroll(id="main-scroll"):
-            yield Static("", id="chart-title", classes="ptitle")
-            yield Static("Starting...", id="status-strip")
-            # Settings panel (hidden by default, toggle with P)
-            with Vertical(id="settings-panel"):
-                yield Static("[bold #ff8c00]═══ INDICATOR SETTINGS ═══[/]")
-                with Horizontal(classes="settings-row"):
-                    yield Checkbox("EMA Fast", value=True, id="chk-ema-fast")
-                    yield Input(value="20", id="inp-ema-fast", placeholder="20")
-                    yield Checkbox("EMA Slow", value=True, id="chk-ema-slow")
-                    yield Input(value="50", id="inp-ema-slow", placeholder="50")
-                with Horizontal(classes="settings-row"):
-                    yield Checkbox("RSI", value=True, id="chk-rsi")
-                    yield Input(value="14", id="inp-rsi", placeholder="14")
-                    yield Checkbox("Stoch", value=True, id="chk-stoch")
-                    yield Input(value="5", id="inp-stoch-k", placeholder="K")
-                    yield Input(value="3", id="inp-stoch-d", placeholder="D")
-                    yield Input(value="3", id="inp-stoch-smooth", placeholder="Sm")
-                with Horizontal(classes="settings-row"):
-                    yield Static(" MACD (F/S/Sig):")
-                    yield Input(value="12", id="inp-macd-fast", placeholder="12")
-                    yield Input(value="26", id="inp-macd-slow", placeholder="26")
-                    yield Input(value="9", id="inp-macd-sig", placeholder="9")
-            yield ImageChartCanvas(id="price-chart")
-            yield Static("", id="ai-analysis")
-            yield Static("", id="macro-intel")
-            yield Static("", id="market-summary", classes="panel")
-            yield NewsPanel(id="news-section", classes="panel")
+        with Vertical(id="app-body"):
+            yield BootPanel(id="boot-panel")
         yield Footer()
 
     def on_mount(self) -> None:
+        self._start_boot()
+
+    # ─── Boot sequence ────────────────────────────────────────────────────────
+
+    def _start_boot(self) -> None:
+        def boot() -> None:
+            worker = get_current_worker()
+            result = BootResult()
+
+            self.call_from_thread(self._boot_log_start, "Verifikasi Environment & Struktur Folder")
+            try:
+                self._verify_boot_environment()
+            except Exception as exc:
+                result.errors.append(f"Environment: {exc}")
+                self.call_from_thread(self._boot_log_failed, "Verifikasi Environment & Struktur Folder", str(exc))
+            else:
+                self.call_from_thread(self._boot_log_ok, "Verifikasi Environment & Struktur Folder")
+
+            self.call_from_thread(self._boot_log_start, "Koneksi yfinance dan penarikan historis BTC-USDT")
+            try:
+                result.dashboard_data = get_btc_dashboard_data()
+            except Exception as exc:
+                result.errors.append(f"Market data: {exc}")
+                self.call_from_thread(self._boot_log_failed, "Koneksi yfinance dan penarikan historis BTC-USDT", str(exc))
+            else:
+                self.call_from_thread(self._boot_log_ok, "Koneksi yfinance dan penarikan historis BTC-USDT")
+
+            self._boot_validate_dashboard_stage(result, "Perhitungan Indikator Teknis Dinamis (EMA, RSI, MACD)", "technical")
+            self._boot_validate_dashboard_stage(result, "Pemindaian struktur pasar untuk deteksi Order Blocks (OB)", "order_blocks")
+
+            self.call_from_thread(self._boot_log_start, "Penarikan data Sentimen Makro (Fear & Greed, Halving)")
+            try:
+                result.macro_data = self._fetch_macro_for_boot(result.dashboard_data)
+            except Exception as exc:
+                result.errors.append(f"Macro intel: {exc}")
+                self.call_from_thread(self._boot_log_failed, "Penarikan data Sentimen Makro (Fear & Greed, Halving)", str(exc))
+            else:
+                self.call_from_thread(self._boot_log_ok, "Penarikan data Sentimen Makro (Fear & Greed, Halving)")
+
+            self.call_from_thread(self._boot_log_start, "Pembuatan Canvas Gambar Piksel Matplotlib")
+            try:
+                result.chart_png = self._build_boot_chart(result.dashboard_data, result.macro_data)
+            except Exception as exc:
+                result.errors.append(f"Pixel canvas: {exc}")
+                self.call_from_thread(self._boot_log_failed, "Pembuatan Canvas Gambar Piksel Matplotlib", str(exc))
+            else:
+                self.call_from_thread(self._boot_log_ok, "Pembuatan Canvas Gambar Piksel Matplotlib")
+
+            if not worker.is_cancelled:
+                self.call_from_thread(self._boot_finished, result)
+
+        self.run_worker(boot, name="boot", group="boot", exclusive=True, thread=True, exit_on_error=False)
+
+    def _verify_boot_environment(self) -> None:
+        base = Path(__file__).resolve().parent
+        required = [base / "data_engine.py", base / "pixel_chart.py", base / "macro_intel.py"]
+        missing = [path.name for path in required if not path.exists()]
+        if missing:
+            raise RuntimeError(f"missing: {', '.join(missing)}")
+
+    def _boot_validate_dashboard_stage(self, result: BootResult, label: str, key: str) -> None:
+        self.call_from_thread(self._boot_log_start, label)
+        try:
+            data = result.dashboard_data or {}
+            sections = [data.get("weekly"), data.get("daily")]
+            if not sections or any(not isinstance(section, dict) or not section.get(key) for section in sections):
+                raise RuntimeError(f"{key} payload unavailable")
+        except Exception as exc:
+            result.errors.append(f"{label}: {exc}")
+            self.call_from_thread(self._boot_log_failed, label, str(exc))
+        else:
+            self.call_from_thread(self._boot_log_ok, label)
+
+    def _fetch_macro_for_boot(self, data: Payload | None) -> Payload:
+        weekly_closes = None
+        if data:
+            section = data.get("weekly")
+            if isinstance(section, dict):
+                candles = section.get("candles", [])
+                weekly_closes = [c["close"] for c in candles if isinstance(c, dict) and "close" in c]
+        try:
+            return get_macro_intel(weekly_closes)
+        except Exception:
+            from btc_investor_tui.macro_intel import get_halving_info, estimate_mvrv_zscore
+
+            return {
+                "halving": get_halving_info(),
+                "fear_greed": {"value": None, "classification": "unavailable"},
+                "mvrv": estimate_mvrv_zscore(weekly_closes) if weekly_closes else {"zscore": None, "zone": "no_data"},
+            }
+
+    def _build_boot_chart(self, data: Payload | None, macro_data: Payload | None) -> bytes:
+        if not data:
+            raise RuntimeError("dashboard data unavailable")
+        section = data.get(self.selected_timeframe)
+        order_blocks = section.get("order_blocks") if isinstance(section, dict) else None
+        return build_dashboard_png(
+            data,
+            macro_data,
+            self.selected_timeframe,
+            self.selected_indicator,
+            order_blocks if isinstance(order_blocks, dict) else None,
+            self.show_ema_fast,
+            self.show_ema_slow,
+            self.ema_fast_period,
+            self.ema_slow_period,
+            self.show_rsi,
+            self.show_stoch,
+        )
+
+    def _boot_log_start(self, label: str) -> None:
+        self._boot_log(f"[bold white][  [#ffcc00]..[/]  ][/] {escape(label)}")
+
+    def _boot_log_ok(self, label: str) -> None:
+        self._boot_log(f"[bold #00ff88][  OK  ][/] {escape(label)}")
+
+    def _boot_log_failed(self, label: str, message: str) -> None:
+        self._boot_log(f"[bold #ff4444][ FAILED ][/] {escape(label)} [#777777]({escape(message)})[/]")
+
+    def _boot_log(self, markup: str) -> None:
+        try:
+            self.query_one("#boot-log", RichLog).write(Text.from_markup(markup))
+        except Exception:
+            pass
+
+    def _boot_finished(self, result: BootResult) -> None:
+        self.dashboard_data = result.dashboard_data
+        self.macro_data = result.macro_data
+        self.boot_chart_png = result.chart_png
+        self.last_error = "; ".join(result.errors) if result.errors and not result.dashboard_data else None
+        self._boot_log("[#666666]Switching to dashboard in 1s...[/]")
+        self.run_worker(self._switch_to_dashboard_after_boot(), name="boot-switch", group="boot", exclusive=False, exit_on_error=False)
+
+    async def _switch_to_dashboard_after_boot(self) -> None:
+        await asyncio.sleep(1.0)
+        await self._mount_dashboard_after_boot()
+
+    async def _mount_dashboard_after_boot(self) -> None:
+        body = self.query_one("#app-body", Vertical)
+        await body.remove_children()
+        await body.mount(DashboardBody(id="main-scroll"))
+        self.boot_complete = True
+        await self._dashboard_mounted_after_boot()
+
+    async def _dashboard_mounted_after_boot(self) -> None:
+        await self.run_action("focus_next")
         self._render_dashboard()
-        self._start_refresh("initial load")
+        if self.dashboard_data and _get_token():
+            self._start_ai_commentary()
 
     # ─── Actions ──────────────────────────────────────────────────────────────
 
@@ -404,7 +581,9 @@ class BTCInvestorApp(App[None]):
             self.dashboard_data, self.macro_data, self.selected_timeframe, self.selected_indicator,
             order_blocks, self.show_ema_fast, self.show_ema_slow,
             self.ema_fast_period, self.ema_slow_period, self.show_rsi, self.show_stoch,
+            self.boot_chart_png,
         )
+        self.boot_chart_png = None
 
     def _render_title(self) -> None:
         w = self.query_one("#chart-title", Static)

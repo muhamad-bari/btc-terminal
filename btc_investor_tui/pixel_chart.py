@@ -49,6 +49,7 @@ class ImageChartCanvas(Static):
         self._ema_slow_p = 50
         self._show_rsi = True
         self._show_stoch = True
+        self._prebuilt_png: bytes | None = None
         self._image_path: Path | None = None
         self._image_widget: Any | None = None
 
@@ -65,6 +66,7 @@ class ImageChartCanvas(Static):
         ema_slow_p: int = 50,
         show_rsi: bool = True,
         show_stoch: bool = True,
+        prebuilt_png: bytes | None = None,
     ) -> None:
         self._data = data
         self._macro_data = macro_data
@@ -77,6 +79,7 @@ class ImageChartCanvas(Static):
         self._ema_slow_p = ema_slow_p
         self._show_rsi = show_rsi
         self._show_stoch = show_stoch
+        self._prebuilt_png = prebuilt_png
         self._render_image()
 
     def on_resize(self) -> None:
@@ -111,26 +114,34 @@ class ImageChartCanvas(Static):
             return
 
         try:
-            png = build_dashboard_png(
-                self._data,
-                self._macro_data,
-                self._timeframe,
-                self._indicator,
-                self._order_blocks,
-                self._ema_fast_on,
-                self._ema_slow_on,
-                self._ema_fast_p,
-                self._ema_slow_p,
-                self._show_rsi,
-                self._show_stoch,
-                max(900, min(1800, max(1, self.size.width) * 12)),
-                max(620, min(1200, max(1, self.size.height) * 20)),
-            )
+            if self._prebuilt_png is not None:
+                png = self._prebuilt_png
+                self._prebuilt_png = None
+            else:
+                png = build_dashboard_png(
+                    self._data,
+                    self._macro_data,
+                    self._timeframe,
+                    self._indicator,
+                    self._order_blocks,
+                    self._ema_fast_on,
+                    self._ema_slow_on,
+                    self._ema_fast_p,
+                    self._ema_slow_p,
+                    self._show_rsi,
+                    self._show_stoch,
+                    max(900, min(1800, max(1, self.size.width) * 12)),
+                    max(620, min(1200, max(1, self.size.height) * 20)),
+                )
         except Exception as exc:
             self.update(Text(f"Could not render pixel chart: {exc}", style="bold red"))
             return
 
-        message = self._display_png(png)
+        try:
+            message = self._display_png(png)
+        except Exception as exc:
+            self.update(Text(f"Could not display pixel chart: {exc}", style="bold red"))
+            return
         if message:
             self.update(Text.from_markup(message))
 
@@ -216,10 +227,19 @@ def build_dashboard_png(
     highs = [_chart_float(candle.get("high")) for candle in visible]
     lows = [_chart_float(candle.get("low")) for candle in visible]
     closes = [_chart_float(candle.get("close")) for candle in visible]
-    valid_prices = [value for value in highs + lows + closes if value is not None]
-    valid_prices.extend(_visible_order_block_prices(order_blocks, start_index, len(visible)))
-    if not valid_prices:
+    candle_prices = [value for value in highs + lows + closes if value is not None]
+    if not candle_prices:
         raise ValueError("candle prices are unavailable")
+    candle_price_min = min(candle_prices)
+    candle_price_max = max(candle_prices)
+    visible_ob_prices = _visible_order_block_prices(
+        order_blocks,
+        start_index,
+        len(visible),
+        candle_price_min,
+        candle_price_max,
+    )
+    valid_prices = candle_prices + visible_ob_prices
 
     dpi = 120
     fig = plt.figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi, facecolor=_CHART_THEME["bg"])
@@ -255,6 +275,7 @@ def build_dashboard_png(
     candle_width = 0.62
     price_min = min(valid_prices)
     price_max = max(valid_prices)
+    ax_price.set_xlim(-0.8, max(len(visible) - 0.2, 0.2))
 
     for x, open_price, high_price, low_price, close_price in zip(x_values, opens, highs, lows, closes):
         if open_price is None or high_price is None or low_price is None or close_price is None:
@@ -286,7 +307,7 @@ def build_dashboard_png(
     y_min = price_min - margin
     y_max = price_max + margin
     ax_price.set_ylim(y_min, y_max)
-    _draw_order_blocks(ax_price, order_blocks, start_index, len(visible), y_min, y_max)
+    _draw_order_blocks(ax_price, order_blocks, start_index, len(visible), y_min, y_max, candle_price_min, candle_price_max)
     tf_label = "1W" if timeframe == "weekly" else "1D"
     ax_price.set_title(
         f"BTC-USDT {tf_label} · Candles / EMA / Impulsive Order Blocks",
@@ -297,12 +318,13 @@ def build_dashboard_png(
         pad=10,
     )
     ax_price.set_title(
-        f"EMA{ema_fast_p} cyan · EMA{ema_slow_p} amber · OB bands transparent",
+        "OB bands transparent",
         color=_CHART_THEME["muted"],
         loc="right",
         fontsize=8,
         pad=10,
     )
+    _draw_axis_key(ax_price, [(f"EMA{ema_fast_p}", _CHART_THEME["cyan"]), (f"EMA{ema_slow_p}", _CHART_THEME["amber"])], x=0.68)
 
     series_payload = series if isinstance(series, dict) else {}
     chart_axes = [ax_price]
@@ -320,7 +342,7 @@ def build_dashboard_png(
     _apply_date_ticks(chart_axes[-1], dates)
     _render_summary_axis(ax_summary, data, macro_data, timeframe, technical)
 
-    fig.subplots_adjust(left=0.055, right=0.985, top=0.91, bottom=0.07)
+    fig.subplots_adjust(left=0.032, right=0.997, top=0.91, bottom=0.07)
     buffer = BytesIO()
     fig.savefig(buffer, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -395,6 +417,8 @@ def _draw_order_blocks(
     visible_len: int,
     y_min: float,
     y_max: float,
+    candle_price_min: float,
+    candle_price_max: float,
 ) -> None:
     rectangle_cls = getattr(importlib.import_module("matplotlib.patches"), "Rectangle")
 
@@ -410,6 +434,8 @@ def _draw_order_blocks(
         high = _chart_float(block.get("price_high"))
         origin = block.get("origin_index")
         if low is None or high is None or origin is None or high <= low:
+            continue
+        if not _order_block_is_relevant(low, high, candle_price_min, candle_price_max):
             continue
         clipped_low = max(low, y_min)
         clipped_high = min(high, y_max)
@@ -442,7 +468,13 @@ def _draw_order_blocks(
         axis.text(x0, label_y, label, color=color, fontsize=7, va=label_va, ha="left", alpha=0.9, clip_on=True)
 
 
-def _visible_order_block_prices(order_blocks: Payload | None, start_index: int, visible_len: int) -> list[float]:
+def _visible_order_block_prices(
+    order_blocks: Payload | None,
+    start_index: int,
+    visible_len: int,
+    candle_price_min: float,
+    candle_price_max: float,
+) -> list[float]:
     if not isinstance(order_blocks, dict):
         return []
     blocks = order_blocks.get("unmitigated") or order_blocks.get("recent") or []
@@ -466,8 +498,18 @@ def _visible_order_block_prices(order_blocks: Payload | None, start_index: int, 
         high = _chart_float(block.get("price_high"))
         if low is None or high is None or high <= low:
             continue
+        if not _order_block_is_relevant(low, high, candle_price_min, candle_price_max):
+            continue
         prices.extend([low, high])
     return prices
+
+
+def _order_block_is_relevant(low: float, high: float, candle_price_min: float, candle_price_max: float) -> bool:
+    candle_range = candle_price_max - candle_price_min
+    if candle_range <= 0:
+        candle_range = max(candle_price_max * 0.02, 1.0)
+    buffer = candle_range * 0.25
+    return high >= candle_price_min - buffer and low <= candle_price_max + buffer
 
 
 def _render_rsi_axis(axis: Any, series: Payload, start_index: int, visible_len: int) -> None:
@@ -478,7 +520,8 @@ def _render_rsi_axis(axis: Any, series: Payload, start_index: int, visible_len: 
     axis.axhline(30, color=_CHART_THEME["green"], linewidth=0.8, alpha=0.7)
     _line_from_visible(axis, _visible_series(series.get("rsi_14"), start_index, visible_len), _CHART_THEME["cyan"], "RSI")
     axis.set_title("RSI", color=_CHART_THEME["amber"], loc="left", fontsize=10, fontweight="bold", pad=8)
-    axis.set_title("line: cyan · zones: 30 / 70", color=_CHART_THEME["muted"], loc="right", fontsize=8, pad=8)
+    axis.set_title("zones: 30 / 70", color=_CHART_THEME["muted"], loc="right", fontsize=8, pad=8)
+    _draw_axis_key(axis, [("RSI", _CHART_THEME["cyan"])], x=0.82)
 
 
 def _render_stoch_axis(axis: Any, series: Payload, start_index: int, visible_len: int) -> None:
@@ -490,7 +533,8 @@ def _render_stoch_axis(axis: Any, series: Payload, start_index: int, visible_len
     _line_from_visible(axis, _visible_series(series.get("stoch_k"), start_index, visible_len), _CHART_THEME["yellow"], "Stoch %K")
     _line_from_visible(axis, _visible_series(series.get("stoch_d"), start_index, visible_len), _CHART_THEME["magenta"], "Stoch %D")
     axis.set_title("Stochastic 5-3-3", color=_CHART_THEME["amber"], loc="left", fontsize=10, fontweight="bold", pad=8)
-    axis.set_title("%K yellow · %D magenta · zones: 20 / 80", color=_CHART_THEME["muted"], loc="right", fontsize=8, pad=8)
+    axis.set_title("zones: 20 / 80", color=_CHART_THEME["muted"], loc="right", fontsize=8, pad=8)
+    _draw_axis_key(axis, [("%K", _CHART_THEME["yellow"]), ("%D", _CHART_THEME["magenta"])], x=0.78)
 
 
 def _render_macd_axis(axis: Any, series: Payload, start_index: int, visible_len: int) -> None:
@@ -505,7 +549,8 @@ def _render_macd_axis(axis: Any, series: Payload, start_index: int, visible_len:
         colors = [_CHART_THEME["green"] if value >= 0 else _CHART_THEME["red"] for _, value in bars]
         axis.bar([index for index, _ in bars], [value for _, value in bars], color=colors, alpha=0.55, width=0.75)
     axis.set_title("MACD Momentum", color=_CHART_THEME["amber"], loc="left", fontsize=10, fontweight="bold", pad=8)
-    axis.set_title("MACD cyan · Signal amber · Histogram bars", color=_CHART_THEME["muted"], loc="right", fontsize=8, pad=8)
+    axis.set_title("Histogram bars", color=_CHART_THEME["muted"], loc="right", fontsize=8, pad=8)
+    _draw_axis_key(axis, [("MACD", _CHART_THEME["cyan"]), ("Signal", _CHART_THEME["amber"])], x=0.68)
 
 
 def _visible_series(values: Any, start_index: int, visible_len: int) -> list[float | None]:
@@ -521,6 +566,24 @@ def _line_from_visible(axis: Any, values: list[float | None], color: str, label:
     points = [(index, value) for index, value in enumerate(values) if value is not None]
     if points:
         axis.plot([index for index, _ in points], [value for _, value in points], color=color, linewidth=1.25, label=label)
+
+
+def _draw_axis_key(axis: Any, entries: list[tuple[str, str]], x: float = 0.70) -> None:
+    cursor = x
+    for label, color in entries:
+        axis.plot([cursor, cursor + 0.035], [1.018, 1.018], color=color, linewidth=2.2, transform=axis.transAxes, clip_on=False)
+        axis.text(
+            cursor + 0.042,
+            1.018,
+            label,
+            color=_CHART_THEME["text"],
+            fontsize=8,
+            va="center",
+            ha="left",
+            transform=axis.transAxes,
+            clip_on=False,
+        )
+        cursor += 0.13
 
 
 def _apply_date_ticks(axis: Any, dates: list[str]) -> None:
