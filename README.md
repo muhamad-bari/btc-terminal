@@ -5,24 +5,10 @@ Bloomberg-style Bitcoin terminal dashboard untuk investor, dibangun dengan Pytho
 ![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  BTC-USDT 1W  $78,123  Strong Bullish (+3)                      │
-├─────────────────────────────────────────────────────────────────┤
-│  ⣿⣷⣾⡆    ⣿⣿⢹⢹⣿⢰⣷⣾⡆         Candlestick + EMA overlay  │
-│  ⢿⢧⡤⡄⡄⣿⡇⠙⢹⣿⣇⣿⢹⢹⣿⢰⣷⣾⡆     + AI Buy/Sell zones       │
-├─────────────────────────────────────────────────────────────────┤
-│  RSI14 ── 70 ── 30          │  ═══ MARKET ═══               │
-│  Stochastic %K %D            │  Price  $78,123  -1.2%        │
-├─────────────────────────────────────────────────────────────────┤
-│  ═══ AI ZONES ═══            │  ═══ BLOOMBERG MACRO ═══      │
-│  █ BUY  $72,000 - $74,000   │  Halving #5  ████░░░░  58%   │
-│  █ SELL $85,000 - $87,000   │  Fear & Greed  27 — Fear      │
-│                              │  MVRV Z-Score  0.52           │
-├─────────────────────────────────────────────────────────────────┤
-│  ═══ NEWS ═══                                                   │
-│  1 Gold Falls Toward $4,550 as Fed-Cut Hopes Fade               │
-│  2 Bitcoin ETF Inflows Hit Record...                            │
-└─────────────────────────────────────────────────────────────────┘
+<p align="center">
+  <img src="asset/ss1.jpg" alt="Screenshot Aplikasi-1" width="750">
+  <img src="asset/ss2.jpg" alt="Screenshot Aplikasi-2" width="750">
+</p>
 ```
 
 ## Features
@@ -146,6 +132,8 @@ btc_investor_tui/
 └── macro_intel.py    # Halving tracker, Fear&Greed, MVRV Z-Score
 ```
 
-## License
+## Kredit & Atribusi
 
-MIT
+Proyek ini merupakan hasil **refactor** dan pengembangan lebih lanjut dari kode sumber asli [tradingview-mcp](https://github.com/atilaahmettaner/tradingview-mcp.git) yang dibuat oleh [@atilaahmettaner](https://github.com/atilaahmettaner). 
+
+Terima kasih kepada pembuat asli atas infrastruktur dasar AI trading yang luar biasa ini. Semua modifikasi dan penyesuaian baru di dalam repositori ini ditujukan untuk kebutuhan spesifik proyek pribadi.
