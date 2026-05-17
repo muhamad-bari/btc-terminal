@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import importlib
+import math
 import os
+import socket
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 _ENDPOINT = "https://models.github.ai/inference/chat/completions"
-_MODEL = "openai/gpt-4.1-mini"
+_MODEL = "openai/gpt-4.1"
 _TIMEOUT = 30
 _PAT_FILE = Path(__file__).resolve().parent.parent / ".github_pat"
 
@@ -50,14 +53,22 @@ def get_order_block_commentary(
             "commentary": "",
         }
 
-    recent = candles[-60:] if len(candles) > 60 else candles
-    candle_summary = [
-        {"d": c["date"], "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]}
-        for c in recent
-    ]
-    block_summary = _summarize_order_blocks(order_blocks)
+    try:
+        recent = candles[-60:] if len(candles) > 60 else candles
+        candle_summary = [
+            {
+                "d": _json_safe(c.get("date")),
+                "o": _json_safe(c.get("open")),
+                "h": _json_safe(c.get("high")),
+                "l": _json_safe(c.get("low")),
+                "c": _json_safe(c.get("close")),
+            }
+            for c in recent
+            if isinstance(c, dict)
+        ]
+        block_summary = _json_safe(_summarize_order_blocks(order_blocks if isinstance(order_blocks, dict) else {}))
 
-    prompt = f"""You are a professional spot BTC market analyst. The order blocks below were detected locally by deterministic volume-pivot logic. Do not invent, alter, add, or remove zones.
+        prompt = f"""You are a professional spot BTC market analyst. The order blocks below were detected locally by deterministic volume-pivot logic. Do not invent, alter, add, or remove zones.
 
 Rules:
 - Spot trading only (no leverage/shorts)
@@ -77,25 +88,25 @@ Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
   "analysis": "2-4 sentences commenting on the provided deterministic order blocks"
 }}"""
 
-    payload = {
-        "model": _MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 800,
-    }
+        payload = {
+            "model": _MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 800,
+        }
 
-    req = urllib.request.Request(
-        _ENDPOINT,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+        req = urllib.request.Request(
+            _ENDPOINT,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "btc-investor-tui",
+            },
+        )
 
-    try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             data = json.loads(resp.read().decode())
         content = data["choices"][0]["message"]["content"]
@@ -114,6 +125,22 @@ Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
             "analysis": analysis,
             "commentary": analysis,
         }
+    except (TimeoutError, socket.timeout) as e:
+        return {
+            "buy_zones": [],
+            "sell_zones": [],
+            "analysis": f"AI commentary timed out after {_TIMEOUT}s. Press A to retry while the dashboard remains usable.",
+            "commentary": "",
+        }
+    except urllib.error.HTTPError as e:
+        detail = _read_http_error(e)
+        hint = _http_error_hint(e.code)
+        return {
+            "buy_zones": [],
+            "sell_zones": [],
+            "analysis": f"AI connection failed ({e.code} {e.reason}). {hint}{detail}",
+            "commentary": "",
+        }
     except Exception as e:
         return {
             "buy_zones": [],
@@ -126,6 +153,50 @@ Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
 def get_ai_zones(candles: list[dict[str, Any]], timeframe: str) -> dict[str, Any]:
     """Compatibility wrapper: AI no longer invents buy/sell zones."""
     return get_order_block_commentary(candles, timeframe, {"unmitigated": [], "recent": []})
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    try:
+        item = value.item()
+    except Exception:
+        item = None
+    else:
+        return _json_safe(item)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return number if math.isfinite(number) else None
+
+
+def _read_http_error(error: urllib.error.HTTPError) -> str:
+    try:
+        body = error.read().decode(errors="replace").strip()
+    except Exception:
+        body = ""
+    if not body:
+        return ""
+    if len(body) > 240:
+        body = body[:237] + "..."
+    return f" Response: {body}"
+
+
+def _http_error_hint(status_code: int) -> str:
+    if status_code in (401, 403):
+        return "Check that the GitHub token is valid and has Models read access. "
+    if status_code == 404:
+        return "GitHub Models endpoint/model was not found for this token/account. "
+    if status_code == 429:
+        return "Rate limit hit; wait a moment then press A again. "
+    return ""
 
 
 def _summarize_order_blocks(order_blocks: dict[str, Any]) -> dict[str, Any]:

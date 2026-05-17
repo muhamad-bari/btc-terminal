@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import importlib
+import importlib.metadata
+import importlib.util
 import logging
 import re
 import sys
@@ -48,6 +50,25 @@ fetch_news_summary = cast(Callable[..., dict[str, Any]], _news_service.fetch_new
 analyze_sentiment = cast(Callable[..., dict[str, Any]], _sentiment_service.analyze_sentiment)
 get_price = cast(Callable[[str], dict[str, Any]], _yahoo_finance_service.get_price)
 
+
+def get_runtime_debug_metadata() -> dict[str, Any]:
+    """Return compact runtime paths to spot stale/global installs."""
+    smc_spec = importlib.util.find_spec("smartmoneyconcepts")
+    try:
+        smc_version = importlib.metadata.version("smartmoneyconcepts")
+    except importlib.metadata.PackageNotFoundError:
+        smc_version = None
+    data_engine_file = Path(__file__).resolve()
+    return {
+        "data_engine_file": str(data_engine_file),
+        "project_root": str(_PROJECT_ROOT),
+        "src_dir": str(_SRC_DIR),
+        "python_executable": sys.executable,
+        "running_from_project": _PROJECT_ROOT in data_engine_file.parents,
+        "smartmoneyconcepts_file": smc_spec.origin if smc_spec else None,
+        "smartmoneyconcepts_version": smc_version,
+    }
+
 BTC_SYMBOL = "BTC-USDT"
 _YAHOO_SYMBOL = "BTC-USD"  # Yahoo Finance uses BTC-USD; we display as BTC-USDT
 DEFAULT_DAILY_PERIOD = "2y"
@@ -59,6 +80,11 @@ DEFAULT_ORDER_BLOCK_PIVOT_RIGHT = 2
 DEFAULT_ORDER_BLOCK_LIMIT = 8
 DEFAULT_ORDER_BLOCK_IMPULSE_LOOKBACK = 20
 DEFAULT_ORDER_BLOCK_ORIGIN_LOOKBACK = 6
+DEFAULT_ORDER_BLOCK_MAX_DISTANCE_PCT = 0.35
+DEFAULT_ORDER_BLOCK_DAILY_MAX_AGE = 180
+DEFAULT_ORDER_BLOCK_WEEKLY_MAX_AGE = 104
+DEFAULT_ORDER_BLOCK_VISIBLE_LOOKBACK = 120
+DEFAULT_ORDER_BLOCK_PRICE_BUFFER_PCT = 0.15
 
 _NEWS_USER_AGENT = (
     "Mozilla/5.0 (compatible; btc-investor-tui/0.1; "
@@ -291,21 +317,37 @@ def detect_order_blocks(
         blocks: list[dict[str, Any]] = []
         valid = ob_result.dropna(subset=["OB"])
         current_price = float(ohlc["close"].iloc[-1])
+        timeframe = _infer_timeframe(candles)
+        max_age = _order_block_max_age(timeframe)
+        envelope_low, envelope_high = _recent_price_envelope(candles, current_price)
         for idx, row in valid.iterrows():
             ob_type = "bullish" if row["OB"] == 1 else "bearish"
             mit_idx = row.get("MitigatedIndex", 0)
             mitigated = not pd.isna(mit_idx) and mit_idx > 0
-            # Skip unmitigated OBs too far from current price (>50% away)
-            if not mitigated:
-                ob_mid = (row["Top"] + row["Bottom"]) / 2
-                distance_pct = abs(ob_mid - current_price) / current_price
-                if distance_pct > 0.50:
-                    continue
-            origin_index = int(idx)
+            try:
+                origin_index = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if origin_index < 0 or origin_index >= len(candles):
+                continue
+            price_low = _finite_float(row.get("Bottom"))
+            price_high = _finite_float(row.get("Top"))
+            if price_low is None or price_high is None or price_high <= price_low:
+                continue
+            ob_mid = (price_high + price_low) / 2
+            distance_pct = abs(ob_mid - current_price) / current_price if current_price else 1.0
+            age_candles = len(candles) - 1 - origin_index
+            if not mitigated and (
+                distance_pct > DEFAULT_ORDER_BLOCK_MAX_DISTANCE_PCT
+                or age_candles > max_age
+                or price_high < envelope_low
+                or price_low > envelope_high
+            ):
+                continue
             blocks.append({
                 "type": ob_type,
-                "price_low": _round_price(row["Bottom"]),
-                "price_high": _round_price(row["Top"]),
+                "price_low": _round_price(price_low),
+                "price_high": _round_price(price_high),
                 "origin_index": origin_index,
                 "origin_date": str(candles[origin_index].get("date", "")),
                 "created_index": origin_index + 1,
@@ -316,6 +358,13 @@ def detect_order_blocks(
                 "mitigated_date": str(candles[int(mit_idx)].get("date", "")) if mitigated and int(mit_idx) < len(candles) else None,
                 "mitigation_mode": mitigation,
                 "label": f"{'Demand' if ob_type == 'bullish' else 'Supply'} OB (SMC structure)",
+                "detector": "smartmoneyconcepts",
+                "timeframe": timeframe,
+                "swing_length": swing_length,
+                "distance_pct": round(distance_pct, 4),
+                "age_candles": age_candles,
+                "filter_max_distance_pct": DEFAULT_ORDER_BLOCK_MAX_DISTANCE_PCT,
+                "filter_max_age_candles": max_age,
             })
         return _order_block_payload(blocks, mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
     except Exception as exc:
@@ -422,6 +471,7 @@ def get_btc_dashboard_data(
             "reddit_sentiment": reddit_sentiment,
             "macro_pulse": macro_pulse,
             "errors": optional_errors,
+            "runtime_debug": get_runtime_debug_metadata(),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception:
@@ -951,6 +1001,27 @@ def _infer_timeframe(candles: list[dict[str, Any]]) -> str:
     if delta_days >= 6:
         return "1W"
     return "1D"
+
+
+def _order_block_max_age(timeframe: str) -> int:
+    if timeframe == "1W":
+        return DEFAULT_ORDER_BLOCK_WEEKLY_MAX_AGE
+    return DEFAULT_ORDER_BLOCK_DAILY_MAX_AGE
+
+
+def _recent_price_envelope(candles: list[dict[str, Any]], current_price: float) -> tuple[float, float]:
+    visible = candles[-min(len(candles), DEFAULT_ORDER_BLOCK_VISIBLE_LOOKBACK):]
+    lows = [_finite_float(candle.get("low")) for candle in visible]
+    highs = [_finite_float(candle.get("high")) for candle in visible]
+    prices = [price for price in lows + highs if price is not None]
+    if not prices:
+        buffer = current_price * DEFAULT_ORDER_BLOCK_PRICE_BUFFER_PCT
+        return current_price - buffer, current_price + buffer
+    low = min(prices)
+    high = max(prices)
+    span = high - low
+    buffer = max(span * DEFAULT_ORDER_BLOCK_PRICE_BUFFER_PCT, current_price * 0.03)
+    return low - buffer, high + buffer
 
 
 def _rolling_window_extreme(series: pd.Series, total_len: int, *, max_points: int, mode: str) -> float | None:

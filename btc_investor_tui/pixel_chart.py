@@ -32,11 +32,16 @@ _CHART_THEME = {
     "magenta": "#e879f9",
 }
 
-_AXIS_HEADER_Y = 1.06
-_AXIS_HEADER_NOTE_Y = 1.06
+_PRICE_HEADER_Y = 1.10
+_INDICATOR_HEADER_Y = 1.28
+_INDICATOR_HEADER_NOTE_Y = 1.30
 _AXIS_KEY_SWATCH_WIDTH = 0.032
 _AXIS_KEY_LABEL_OFFSET = 0.040
 _AXIS_KEY_ENTRY_GAP = 0.125
+_MACRO_TOP_RULE_Y = 0.94
+_MACRO_TITLE_Y = 1.10
+_MACRO_ROW_ONE_Y = 0.48
+_MACRO_ROW_TWO_Y = 0.15
 
 
 class ImageChartCanvas(Static):
@@ -55,6 +60,13 @@ class ImageChartCanvas(Static):
         self._ema_slow_p = 50
         self._show_rsi = True
         self._show_stoch = True
+        self._rsi_p = 14
+        self._stoch_k = 5
+        self._stoch_d = 3
+        self._stoch_smooth = 3
+        self._macd_fast = 12
+        self._macd_slow = 26
+        self._macd_signal = 9
         self._prebuilt_png: bytes | None = None
         self._image_path: Path | None = None
         self._image_widget: Any | None = None
@@ -72,6 +84,13 @@ class ImageChartCanvas(Static):
         ema_slow_p: int = 50,
         show_rsi: bool = True,
         show_stoch: bool = True,
+        rsi_p: int = 14,
+        stoch_k: int = 5,
+        stoch_d: int = 3,
+        stoch_smooth: int = 3,
+        macd_fast: int = 12,
+        macd_slow: int = 26,
+        macd_signal: int = 9,
         prebuilt_png: bytes | None = None,
     ) -> None:
         self._data = data
@@ -85,6 +104,13 @@ class ImageChartCanvas(Static):
         self._ema_slow_p = ema_slow_p
         self._show_rsi = show_rsi
         self._show_stoch = show_stoch
+        self._rsi_p = rsi_p
+        self._stoch_k = stoch_k
+        self._stoch_d = stoch_d
+        self._stoch_smooth = stoch_smooth
+        self._macd_fast = macd_fast
+        self._macd_slow = macd_slow
+        self._macd_signal = macd_signal
         self._prebuilt_png = prebuilt_png
         self._render_image()
 
@@ -112,13 +138,8 @@ class ImageChartCanvas(Static):
 
         missing = _missing_pixel_chart_dependencies()
         if missing:
-            names = ", ".join(missing)
-            self.update(
-                Text.from_markup(
-                    "[bold #ff8c00]PIXEL CHART UNAVAILABLE[/]\n"
-                    f"Missing optional package(s): [bold]{escape(names)}[/].\n"
-                    "Install [bold]matplotlib[/], [bold]pillow[/], and [bold]textual-image[/] for Kitty/Sixel/fallback pixel charts."
-                )
+            self._render_text_fallback(
+                f"Pixel image backend unavailable: missing {', '.join(missing)}"
             )
             return
 
@@ -139,20 +160,27 @@ class ImageChartCanvas(Static):
                     self._ema_slow_p,
                     self._show_rsi,
                     self._show_stoch,
+                    self._rsi_p,
+                    self._stoch_k,
+                    self._stoch_d,
+                    self._stoch_smooth,
+                    self._macd_fast,
+                    self._macd_slow,
+                    self._macd_signal,
                     max(900, min(1800, max(1, self.size.width) * 12)),
                     max(620, min(1200, max(1, self.size.height) * 20)),
                 )
         except Exception as exc:
-            self.update(Text(f"Could not render pixel chart: {exc}", style="bold red"))
+            self._render_text_fallback(f"Could not render pixel chart: {exc}")
             return
 
         try:
             message = self._display_png(png)
         except Exception as exc:
-            self.update(Text(f"Could not display pixel chart: {exc}", style="bold red"))
+            self._render_text_fallback(f"Could not display pixel chart: {exc}")
             return
         if message:
-            self.update(Text.from_markup(message))
+            self._render_text_fallback(message)
 
     def _display_png(self, png: bytes) -> str | None:
         image = _png_to_pillow_image(png)
@@ -167,12 +195,8 @@ class ImageChartCanvas(Static):
 
         widget = _textual_image_widget(image)
         if widget is None:
-            path = self._write_png_temp(png)
-            return (
-                "[bold #ff8c00]PIXEL CHART RENDERED[/]\n"
-                "textual-image is installed, but no compatible widget/renderable API was found.\n"
-                f"PNG saved at: {escape(str(path))}"
-            )
+            self._write_png_temp(png)
+            return "textual-image is installed, but no compatible terminal image widget was found"
         widget.styles.width = "100%"
         widget.styles.height = "100%"
         self._image_widget = widget
@@ -181,9 +205,45 @@ class ImageChartCanvas(Static):
         self.mount(widget)
         return None
 
+    def _render_text_fallback(self, reason: str) -> None:
+        try:
+            chart = _build_text_chart_fallback(
+                self._data,
+                self._timeframe,
+                self._indicator,
+                self._order_blocks,
+                self._ema_fast_on,
+                self._ema_slow_on,
+                self._ema_fast_p,
+                self._ema_slow_p,
+                self._show_rsi,
+                self._show_stoch,
+                self._rsi_p,
+                self._stoch_k,
+                self._stoch_d,
+                self._stoch_smooth,
+                self._macd_fast,
+                self._macd_slow,
+                self._macd_signal,
+                max(78, self.size.width - 4),
+                max(24, self.size.height - 4),
+                reason,
+            )
+        except Exception as exc:
+            self.remove_children()
+            self.update(
+                Text(f"Could not render image or text chart: {exc}", style="bold red")
+            )
+            return
+        self._image_widget = None
+        self.remove_children()
+        self.update(Text.from_ansi(chart))
+
     def _write_png_temp(self, png: bytes) -> Path:
         self._cleanup_image_path()
-        temp = NamedTemporaryFile(prefix="btc-investor-chart-", suffix=".png", delete=False)
+        temp = NamedTemporaryFile(
+            prefix="btc-investor-chart-", suffix=".png", delete=False
+        )
         try:
             temp.write(png)
             self._image_path = Path(temp.name)
@@ -200,6 +260,79 @@ class ImageChartCanvas(Static):
         self._image_path = None
 
 
+def _build_text_chart_fallback(
+    data: Payload | None,
+    timeframe: str,
+    indicator: str,
+    order_blocks: Payload | None,
+    ema_fast_on: bool,
+    ema_slow_on: bool,
+    ema_fast_p: int,
+    ema_slow_p: int,
+    show_rsi: bool,
+    show_stoch: bool,
+    rsi_p: int,
+    stoch_k: int,
+    stoch_d: int,
+    stoch_smooth: int,
+    macd_fast: int,
+    macd_slow: int,
+    macd_signal: int,
+    width: int,
+    height: int,
+    reason: str,
+) -> str:
+    if not data:
+        return reason
+    section = data.get(timeframe)
+    if not isinstance(section, dict):
+        return reason
+    candles = section.get("candles", [])
+    technical = section.get("technical", {})
+    if not isinstance(candles, list) or not isinstance(technical, dict) or not candles:
+        return reason
+    try:
+        from btc_investor_tui.chart_renderer import (
+            build_indicator_chart,
+            build_price_chart,
+        )
+    except Exception as exc:
+        return f"{reason}\nText chart fallback unavailable: {exc}"
+
+    price_height = max(12, int(height * 0.65))
+    indicator_height = max(8, height - price_height - 2)
+    price_chart = build_price_chart(
+        candles,
+        technical,
+        timeframe,
+        width,
+        price_height,
+        order_blocks,
+        ema_fast_on,
+        ema_slow_on,
+        ema_fast_p,
+        ema_slow_p,
+    )
+    indicator_chart = build_indicator_chart(
+        candles,
+        technical,
+        timeframe,
+        indicator,
+        width,
+        indicator_height,
+        show_rsi,
+        show_stoch,
+        rsi_p,
+        stoch_k,
+        stoch_d,
+        stoch_smooth,
+        macd_fast,
+        macd_slow,
+        macd_signal,
+    )
+    return f"{reason}\nUsing terminal text chart fallback.\n\n{price_chart}\n\n{indicator_chart}"
+
+
 def build_dashboard_png(
     data: Payload,
     macro_data: Payload | None,
@@ -212,6 +345,13 @@ def build_dashboard_png(
     ema_slow_p: int,
     show_rsi: bool,
     show_stoch: bool,
+    rsi_p: int = 14,
+    stoch_k: int = 5,
+    stoch_d: int = 3,
+    stoch_smooth: int = 3,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
     width_px: int = 1300,
     height_px: int = 820,
 ) -> bytes:
@@ -251,17 +391,21 @@ def build_dashboard_png(
     valid_prices = candle_prices + visible_ob_prices
 
     dpi = 120
-    fig = plt.figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi, facecolor=_CHART_THEME["bg"])
+    fig = plt.figure(
+        figsize=(width_px / dpi, height_px / dpi), dpi=dpi, facecolor=_CHART_THEME["bg"]
+    )
     has_macd_panel = indicator == "macd"
-    height_ratios = [5.4]
+    height_ratios = [5.25]
     if show_rsi:
-        height_ratios.append(1.05)
+        height_ratios.append(1.24)
     if show_stoch:
-        height_ratios.append(1.05)
+        height_ratios.append(1.24)
     if has_macd_panel:
-        height_ratios.append(1.12)
-    height_ratios.append(1.0)
-    grid = fig.add_gridspec(len(height_ratios), 1, height_ratios=height_ratios, hspace=0.78)
+        height_ratios.append(1.30)
+    height_ratios.append(1.35)
+    grid = fig.add_gridspec(
+        len(height_ratios), 1, height_ratios=height_ratios, hspace=0.92
+    )
     ax_price = fig.add_subplot(grid[0])
     row = 1
     ax_rsi = fig.add_subplot(grid[row], sharex=ax_price) if show_rsi else None
@@ -286,13 +430,26 @@ def build_dashboard_png(
     price_max = max(valid_prices)
     ax_price.set_xlim(-0.8, max(len(visible) - 0.2, 0.2))
 
-    for x, open_price, high_price, low_price, close_price in zip(x_values, opens, highs, lows, closes):
-        if open_price is None or high_price is None or low_price is None or close_price is None:
+    for x, open_price, high_price, low_price, close_price in zip(
+        x_values, opens, highs, lows, closes
+    ):
+        if (
+            open_price is None
+            or high_price is None
+            or low_price is None
+            or close_price is None
+        ):
             continue
-        color = _CHART_THEME["green"] if close_price >= open_price else _CHART_THEME["red"]
-        ax_price.vlines(x, low_price, high_price, color=color, linewidth=1.2, alpha=0.85)
+        color = (
+            _CHART_THEME["green"] if close_price >= open_price else _CHART_THEME["red"]
+        )
+        ax_price.vlines(
+            x, low_price, high_price, color=color, linewidth=1.2, alpha=0.85
+        )
         body_bottom = min(open_price, close_price)
-        body_height = max(abs(close_price - open_price), (price_max - price_min) * 0.002)
+        body_height = max(
+            abs(close_price - open_price), (price_max - price_min) * 0.002
+        )
         ax_price.add_patch(
             rectangle_cls(
                 (x - candle_width / 2, body_bottom),
@@ -305,18 +462,45 @@ def build_dashboard_png(
             )
         )
 
-    series = technical.get("indicator_series", {}) if isinstance(technical, dict) else {}
+    series = (
+        technical.get("indicator_series", {}) if isinstance(technical, dict) else {}
+    )
     if isinstance(series, dict):
         if ema_fast_on:
-            _plot_series(ax_price, series.get("ema_20"), start_index, _CHART_THEME["cyan"], f"EMA{ema_fast_p}")
+            _plot_series(
+                ax_price,
+                series.get("ema_20"),
+                start_index,
+                _CHART_THEME["cyan"],
+                f"EMA{ema_fast_p}",
+            )
         if ema_slow_on:
-            _plot_series(ax_price, series.get("ema_50"), start_index, _CHART_THEME["amber"], f"EMA{ema_slow_p}")
+            _plot_series(
+                ax_price,
+                series.get("ema_50"),
+                start_index,
+                _CHART_THEME["amber"],
+                f"EMA{ema_slow_p}",
+            )
 
-    margin = (price_max - price_min) * 0.08 if price_max > price_min else max(price_max * 0.02, 1)
+    margin = (
+        (price_max - price_min) * 0.08
+        if price_max > price_min
+        else max(price_max * 0.02, 1)
+    )
     y_min = price_min - margin
     y_max = price_max + margin
     ax_price.set_ylim(y_min, y_max)
-    _draw_order_blocks(ax_price, order_blocks, start_index, len(visible), y_min, y_max, candle_price_min, candle_price_max)
+    _draw_order_blocks(
+        ax_price,
+        order_blocks,
+        start_index,
+        len(visible),
+        y_min,
+        y_max,
+        candle_price_min,
+        candle_price_max,
+    )
     tf_label = "1W" if timeframe == "weekly" else "1D"
     ema_entries = []
     if ema_fast_on:
@@ -329,24 +513,55 @@ def build_dashboard_png(
         ema_entries,
         note="OB bands transparent",
         key_x=0.47,
+        header_y=_PRICE_HEADER_Y,
+        note_y=_PRICE_HEADER_Y,
+        key_y=_PRICE_HEADER_Y,
         title_size=13,
     )
 
     series_payload = series if isinstance(series, dict) else {}
     chart_axes = [ax_price]
     if ax_rsi is not None:
-        _render_rsi_axis(ax_rsi, series_payload, start_index, len(visible))
+        _render_rsi_axis(ax_rsi, series_payload, start_index, len(visible), rsi_p)
         chart_axes.append(ax_rsi)
     if ax_stoch is not None:
-        _render_stoch_axis(ax_stoch, series_payload, start_index, len(visible))
+        _render_stoch_axis(
+            ax_stoch,
+            series_payload,
+            start_index,
+            len(visible),
+            stoch_k,
+            stoch_d,
+            stoch_smooth,
+        )
         chart_axes.append(ax_stoch)
     if ax_macd is not None:
-        _render_macd_axis(ax_macd, series_payload, start_index, len(visible))
+        _render_macd_axis(
+            ax_macd,
+            series_payload,
+            start_index,
+            len(visible),
+            macd_fast,
+            macd_slow,
+            macd_signal,
+        )
         chart_axes.append(ax_macd)
     for axis in chart_axes[:-1]:
         axis.tick_params(labelbottom=False)
     _apply_date_ticks(chart_axes[-1], dates)
-    _render_summary_axis(ax_summary, data, macro_data, timeframe, technical)
+    _render_summary_axis(
+        ax_summary,
+        data,
+        macro_data,
+        timeframe,
+        technical,
+        ema_fast_p,
+        ema_slow_p,
+        rsi_p,
+        macd_fast,
+        macd_slow,
+        macd_signal,
+    )
 
     fig.subplots_adjust(left=0.032, right=0.997, top=0.96, bottom=0.07)
     buffer = BytesIO()
@@ -357,7 +572,11 @@ def build_dashboard_png(
 
 def _missing_pixel_chart_dependencies() -> list[str]:
     missing: list[str] = []
-    for module_name, package_name in (("matplotlib", "matplotlib"), ("PIL", "pillow"), ("textual_image", "textual-image")):
+    for module_name, package_name in (
+        ("matplotlib", "matplotlib"),
+        ("PIL", "pillow"),
+        ("textual_image", "textual-image"),
+    ):
         if importlib.util.find_spec(module_name) is None:
             missing.append(package_name)
     return missing
@@ -377,7 +596,9 @@ def _textual_image_widget(image: Any) -> Any | None:
         return None
 
     class_names = ("TGPImage", "SixelImage", "HalfcellImage", "UnicodeImage")
-    if "kitty" not in (os.environ.get("TERM") or "").lower() and not os.environ.get("KITTY_WINDOW_ID"):
+    if "kitty" not in (os.environ.get("TERM") or "").lower() and not os.environ.get(
+        "KITTY_WINDOW_ID"
+    ):
         class_names = ("SixelImage", "HalfcellImage", "UnicodeImage", "TGPImage")
     for class_name in class_names:
         image_cls = getattr(module, class_name, None)
@@ -406,14 +627,22 @@ def _chart_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _plot_series(axis: Any, values: Any, start_index: int, color: str, label: str) -> None:
+def _plot_series(
+    axis: Any, values: Any, start_index: int, color: str, label: str
+) -> None:
     if not isinstance(values, list):
         return
     visible = values[start_index:]
     points = [(index, _chart_float(value)) for index, value in enumerate(visible)]
     points = [(index, value) for index, value in points if value is not None]
     if points:
-        axis.plot([point[0] for point in points], [point[1] for point in points], color=color, linewidth=1.45, label=label)
+        axis.plot(
+            [point[0] for point in points],
+            [point[1] for point in points],
+            color=color,
+            linewidth=1.45,
+            label=label,
+        )
 
 
 def _draw_order_blocks(
@@ -454,7 +683,11 @@ def _draw_order_blocks(
         x0 = max(0, origin_index - start_index)
         if x0 >= visible_len:
             continue
-        color = _CHART_THEME["green"] if block.get("type") == "bullish" else _CHART_THEME["red"]
+        color = (
+            _CHART_THEME["green"]
+            if block.get("type") == "bullish"
+            else _CHART_THEME["red"]
+        )
         patch = rectangle_cls(
             (x0 - 0.5, clipped_low),
             visible_len - x0,
@@ -469,9 +702,23 @@ def _draw_order_blocks(
         axis.add_patch(patch)
         label = "DEMAND" if block.get("type") == "bullish" else "SUPPLY"
         band_height = clipped_high - clipped_low
-        label_y = clipped_low + band_height * 0.12 if block.get("type") == "bullish" else clipped_high - band_height * 0.12
+        label_y = (
+            clipped_low + band_height * 0.12
+            if block.get("type") == "bullish"
+            else clipped_high - band_height * 0.12
+        )
         label_va = "bottom" if block.get("type") == "bullish" else "top"
-        axis.text(x0, label_y, label, color=color, fontsize=7, va=label_va, ha="left", alpha=0.9, clip_on=True)
+        axis.text(
+            x0,
+            label_y,
+            label,
+            color=color,
+            fontsize=7,
+            va=label_va,
+            ha="left",
+            alpha=0.9,
+            clip_on=True,
+        )
 
 
 def _visible_order_block_prices(
@@ -510,7 +757,9 @@ def _visible_order_block_prices(
     return prices
 
 
-def _order_block_is_relevant(low: float, high: float, candle_price_min: float, candle_price_max: float) -> bool:
+def _order_block_is_relevant(
+    low: float, high: float, candle_price_min: float, candle_price_max: float
+) -> bool:
     candle_range = candle_price_max - candle_price_min
     if candle_range <= 0:
         candle_range = max(candle_price_max * 0.02, 1.0)
@@ -522,66 +771,145 @@ def _order_block_is_relevant(low: float, high: float, candle_price_min: float, c
     return high >= expanded_min and low <= expanded_max
 
 
-def _render_rsi_axis(axis: Any, series: Payload, start_index: int, visible_len: int) -> None:
+def _render_rsi_axis(
+    axis: Any, series: Payload, start_index: int, visible_len: int, rsi_p: int
+) -> None:
     axis.set_ylim(0, 100)
     axis.axhspan(70, 100, color=_CHART_THEME["red"], alpha=0.08)
     axis.axhspan(0, 30, color=_CHART_THEME["green"], alpha=0.08)
     axis.axhline(70, color=_CHART_THEME["red"], linewidth=0.8, alpha=0.7)
     axis.axhline(30, color=_CHART_THEME["green"], linewidth=0.8, alpha=0.7)
-    _line_from_visible(axis, _visible_series(series.get("rsi_14"), start_index, visible_len), _CHART_THEME["cyan"], "RSI")
-    _draw_axis_header(axis, "RSI", [("RSI", _CHART_THEME["cyan"])], note="zones: 30 / 70", key_x=0.10)
+    label = f"RSI{rsi_p}"
+    _line_from_visible(
+        axis,
+        _visible_series(series.get("rsi_14"), start_index, visible_len),
+        _CHART_THEME["cyan"],
+        label,
+    )
+    _draw_axis_header(
+        axis,
+        label,
+        [(label, _CHART_THEME["cyan"])],
+        note="zones: 30 / 70",
+        key_x=0.12,
+        header_y=_INDICATOR_HEADER_Y,
+        note_y=_INDICATOR_HEADER_NOTE_Y,
+        key_y=_INDICATOR_HEADER_Y,
+        title_size=10,
+    )
 
 
-def _render_stoch_axis(axis: Any, series: Payload, start_index: int, visible_len: int) -> None:
+def _render_stoch_axis(
+    axis: Any,
+    series: Payload,
+    start_index: int,
+    visible_len: int,
+    stoch_k: int,
+    stoch_d: int,
+    stoch_smooth: int,
+) -> None:
     axis.set_ylim(0, 100)
     axis.axhspan(80, 100, color=_CHART_THEME["red"], alpha=0.08)
     axis.axhspan(0, 20, color=_CHART_THEME["green"], alpha=0.08)
     axis.axhline(80, color=_CHART_THEME["red"], linewidth=0.8, alpha=0.7)
     axis.axhline(20, color=_CHART_THEME["green"], linewidth=0.8, alpha=0.7)
-    _line_from_visible(axis, _visible_series(series.get("stoch_k"), start_index, visible_len), _CHART_THEME["yellow"], "Stoch %K")
-    _line_from_visible(axis, _visible_series(series.get("stoch_d"), start_index, visible_len), _CHART_THEME["magenta"], "Stoch %D")
+    _line_from_visible(
+        axis,
+        _visible_series(series.get("stoch_k"), start_index, visible_len),
+        _CHART_THEME["yellow"],
+        f"%K{stoch_k}",
+    )
+    _line_from_visible(
+        axis,
+        _visible_series(series.get("stoch_d"), start_index, visible_len),
+        _CHART_THEME["magenta"],
+        f"%D{stoch_d}",
+    )
     _draw_axis_header(
         axis,
-        "Stochastic 5-3-3",
-        [("%K", _CHART_THEME["yellow"]), ("%D", _CHART_THEME["magenta"])],
+        f"Stochastic {stoch_k}-{stoch_d}-{stoch_smooth}",
+        [
+            (f"%K{stoch_k}", _CHART_THEME["yellow"]),
+            (f"%D{stoch_d}", _CHART_THEME["magenta"]),
+        ],
         note="zones: 20 / 80",
-        key_x=0.22,
+        key_x=0.26,
+        header_y=_INDICATOR_HEADER_Y,
+        note_y=_INDICATOR_HEADER_NOTE_Y,
+        key_y=_INDICATOR_HEADER_Y,
+        title_size=10,
     )
 
 
-def _render_macd_axis(axis: Any, series: Payload, start_index: int, visible_len: int) -> None:
+def _render_macd_axis(
+    axis: Any,
+    series: Payload,
+    start_index: int,
+    visible_len: int,
+    macd_fast: int,
+    macd_slow: int,
+    macd_signal: int,
+) -> None:
     macd = _visible_series(series.get("macd"), start_index, visible_len)
     signal = _visible_series(series.get("macd_signal"), start_index, visible_len)
     histogram = _visible_series(series.get("macd_histogram"), start_index, visible_len)
     axis.axhline(0, color=_CHART_THEME["muted"], linewidth=0.8)
     _line_from_visible(axis, macd, _CHART_THEME["cyan"], "MACD")
     _line_from_visible(axis, signal, _CHART_THEME["amber"], "Signal")
-    bars = [(index, value) for index, value in enumerate(histogram) if value is not None]
+    bars = [
+        (index, value) for index, value in enumerate(histogram) if value is not None
+    ]
     if bars:
-        colors = [_CHART_THEME["green"] if value >= 0 else _CHART_THEME["red"] for _, value in bars]
-        axis.bar([index for index, _ in bars], [value for _, value in bars], color=colors, alpha=0.55, width=0.75)
+        colors = [
+            _CHART_THEME["green"] if value >= 0 else _CHART_THEME["red"]
+            for _, value in bars
+        ]
+        axis.bar(
+            [index for index, _ in bars],
+            [value for _, value in bars],
+            color=colors,
+            alpha=0.55,
+            width=0.75,
+        )
     _draw_axis_header(
         axis,
-        "MACD Momentum",
-        [("MACD", _CHART_THEME["cyan"]), ("Signal", _CHART_THEME["amber"])],
+        f"MACD {macd_fast}-{macd_slow}-{macd_signal}",
+        [
+            (f"MACD {macd_fast}/{macd_slow}", _CHART_THEME["cyan"]),
+            (f"Signal {macd_signal}", _CHART_THEME["amber"]),
+        ],
         note="Histogram bars",
-        key_x=0.20,
+        key_x=0.24,
+        header_y=_INDICATOR_HEADER_Y,
+        note_y=_INDICATOR_HEADER_NOTE_Y,
+        key_y=_INDICATOR_HEADER_Y,
+        title_size=10,
     )
 
 
-def _visible_series(values: Any, start_index: int, visible_len: int) -> list[float | None]:
+def _visible_series(
+    values: Any, start_index: int, visible_len: int
+) -> list[float | None]:
     if not isinstance(values, list):
         return [None] * visible_len
-    sliced = values[start_index:start_index + visible_len]
+    sliced = values[start_index : start_index + visible_len]
     if len(sliced) < visible_len:
         sliced = [None] * (visible_len - len(sliced)) + sliced
     return [_chart_float(value) for value in sliced]
 
 
-def _line_from_visible(axis: Any, values: list[float | None], color: str, label: str) -> None:
+def _line_from_visible(
+    axis: Any, values: list[float | None], color: str, label: str
+) -> None:
     points = [(index, value) for index, value in enumerate(values) if value is not None]
     if points:
-        axis.plot([index for index, _ in points], [value for _, value in points], color=color, linewidth=1.25, label=label)
+        axis.plot(
+            [index for index, _ in points],
+            [value for _, value in points],
+            color=color,
+            linewidth=1.25,
+            label=label,
+        )
 
 
 def _draw_axis_header(
@@ -591,10 +919,16 @@ def _draw_axis_header(
     note: str | None = None,
     key_x: float = 0.20,
     title_size: int = 10,
+    header_y: float = _PRICE_HEADER_Y,
+    note_y: float | None = None,
+    key_y: float | None = None,
+    key_entry_gap: float = _AXIS_KEY_ENTRY_GAP,
 ) -> None:
+    note_y = header_y if note_y is None else note_y
+    key_y = header_y if key_y is None else key_y
     axis.text(
         0.0,
-        _AXIS_HEADER_Y,
+        header_y,
         title,
         color=_CHART_THEME["amber"],
         fontsize=title_size,
@@ -604,11 +938,11 @@ def _draw_axis_header(
         transform=axis.transAxes,
         clip_on=False,
     )
-    _draw_axis_key(axis, entries, x=key_x)
+    _draw_axis_key(axis, entries, x=key_x, y=key_y, entry_gap=key_entry_gap)
     if note:
         axis.text(
             1.0,
-            _AXIS_HEADER_NOTE_Y,
+            note_y,
             note,
             color=_CHART_THEME["muted"],
             fontsize=8,
@@ -619,12 +953,18 @@ def _draw_axis_header(
         )
 
 
-def _draw_axis_key(axis: Any, entries: list[tuple[str, str]], x: float = 0.70) -> None:
+def _draw_axis_key(
+    axis: Any,
+    entries: list[tuple[str, str]],
+    x: float = 0.70,
+    y: float = _PRICE_HEADER_Y,
+    entry_gap: float = _AXIS_KEY_ENTRY_GAP,
+) -> None:
     cursor = x
     for label, color in entries:
         axis.plot(
             [cursor, cursor + _AXIS_KEY_SWATCH_WIDTH],
-            [_AXIS_HEADER_Y, _AXIS_HEADER_Y],
+            [y, y],
             color=color,
             linewidth=2.2,
             transform=axis.transAxes,
@@ -632,7 +972,7 @@ def _draw_axis_key(axis: Any, entries: list[tuple[str, str]], x: float = 0.70) -
         )
         axis.text(
             cursor + _AXIS_KEY_LABEL_OFFSET,
-            _AXIS_HEADER_Y,
+            y,
             label,
             color=_CHART_THEME["text"],
             fontsize=8,
@@ -641,7 +981,7 @@ def _draw_axis_key(axis: Any, entries: list[tuple[str, str]], x: float = 0.70) -
             transform=axis.transAxes,
             clip_on=False,
         )
-        cursor += _AXIS_KEY_ENTRY_GAP
+        cursor += entry_gap
 
 
 def _apply_date_ticks(axis: Any, dates: list[str]) -> None:
@@ -652,10 +992,27 @@ def _apply_date_ticks(axis: Any, dates: list[str]) -> None:
     if positions[-1] != len(dates) - 1:
         positions.append(len(dates) - 1)
     axis.set_xticks(positions)
-    axis.set_xticklabels([dates[index][-10:] for index in positions], rotation=0, ha="center", color=_CHART_THEME["muted"])
+    axis.set_xticklabels(
+        [dates[index][-10:] for index in positions],
+        rotation=0,
+        ha="center",
+        color=_CHART_THEME["muted"],
+    )
 
 
-def _render_summary_axis(axis: Any, data: Payload, macro_data: Payload | None, timeframe: str, technical: Payload) -> None:
+def _render_summary_axis(
+    axis: Any,
+    data: Payload,
+    macro_data: Payload | None,
+    timeframe: str,
+    technical: Payload,
+    ema_fast_p: int,
+    ema_slow_p: int,
+    rsi_p: int,
+    macd_fast: int,
+    macd_slow: int,
+    macd_signal: int,
+) -> None:
     axis.set_facecolor(_CHART_THEME["bg"])
     axis.axis("off")
     quote = data.get("quote") or {}
@@ -671,17 +1028,41 @@ def _render_summary_axis(axis: Any, data: Payload, macro_data: Payload | None, t
         f"BTC-USDT {tf_label}",
         f"Price {_fmt_usd(market.get('price') or quote.get('price'))}  {_plain_pct(quote.get('change_pct'))}",
         f"Trend {_fmt_label(technical.get('trend_label'))}  Risk {_fmt_label(technical.get('risk_label'))}",
-        f"EMA20 {_fmt_usd(moving.get('ema_20'))}  EMA50 {_fmt_usd(moving.get('ema_50'))}",
+        f"EMA{ema_fast_p} {_fmt_usd(moving.get('ema_20'))}  EMA{ema_slow_p} {_fmt_usd(moving.get('ema_50'))}",
     ]
     row_two = [
-        f"RSI {_fmt_num(osc.get('rsi_14'))}  MACD {_fmt_num(osc.get('macd'), 3)}",
+        f"RSI{rsi_p} {_fmt_num(osc.get('rsi_14'))}  MACD({macd_fast},{macd_slow},{macd_signal}) {_fmt_num(osc.get('macd'), 3)}",
         f"Halving {halving.get('cycle_progress_pct', 'n/a')}%  Fear/Greed {fear.get('value', 'n/a')} {fear.get('classification', '')}",
         f"MVRV {mvrv.get('zscore', 'n/a')}  {str(mvrv.get('zone', 'n/a')).replace('_', ' ').title()}",
     ]
-    axis.axhline(0.92, color=_CHART_THEME["grid"], linewidth=1.0, alpha=0.75)
-    axis.text(0.01, 0.70, "MACRO SNAPSHOT", color=_CHART_THEME["amber"], fontsize=12, fontweight="bold", transform=axis.transAxes)
-    axis.text(0.01, 0.42, "  |  ".join(row_one), color=_CHART_THEME["text"], fontsize=8.7, transform=axis.transAxes)
-    axis.text(0.01, 0.16, "  |  ".join(row_two), color=_CHART_THEME["text"], fontsize=8.7, transform=axis.transAxes)
+    axis.axhline(
+        _MACRO_TOP_RULE_Y, color=_CHART_THEME["grid"], linewidth=1.0, alpha=0.75
+    )
+    axis.text(
+        0.01,
+        _MACRO_TITLE_Y,
+        "MACRO SNAPSHOT",
+        color=_CHART_THEME["amber"],
+        fontsize=12,
+        fontweight="bold",
+        transform=axis.transAxes,
+    )
+    axis.text(
+        0.01,
+        _MACRO_ROW_ONE_Y,
+        "  |  ".join(row_one),
+        color=_CHART_THEME["text"],
+        fontsize=8.7,
+        transform=axis.transAxes,
+    )
+    axis.text(
+        0.01,
+        _MACRO_ROW_TWO_Y,
+        "  |  ".join(row_two),
+        color=_CHART_THEME["text"],
+        fontsize=8.7,
+        transform=axis.transAxes,
+    )
 
 
 def _plain_pct(value: Any) -> str:

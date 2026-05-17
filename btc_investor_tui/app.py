@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 import webbrowser
 import asyncio
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Click
 from textual.reactive import reactive
-from textual.widgets import Checkbox, Footer, Header, Input, RichLog, Static
+from textual.widgets import Checkbox, Footer, Header, Input, Static
 from textual.worker import get_current_worker
 
 if __package__ in (None, ""):
@@ -27,7 +28,7 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-from btc_investor_tui.data_engine import get_btc_dashboard_data, recalculate_indicators
+from btc_investor_tui.data_engine import get_btc_dashboard_data, get_runtime_debug_metadata, recalculate_indicators
 from btc_investor_tui.ai_zones import get_order_block_commentary, _get_token, save_token
 from btc_investor_tui.macro_intel import get_macro_intel
 from btc_investor_tui.pixel_chart import ImageChartCanvas, build_dashboard_png
@@ -48,7 +49,7 @@ class BootPanel(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("BTC INVESTOR TERMINAL", id="boot-title")
-        yield RichLog(id="boot-log", markup=True, wrap=True, highlight=False)
+        yield Static("", id="boot-log")
 
 
 class DashboardBody(VerticalScroll):
@@ -126,14 +127,14 @@ class BTCInvestorApp(App[None]):
     ]
 
     CSS = """
-    Screen { background: #000000; color: #e0e0e0; }
+    Screen { background: #000000; color: #e0e0e0; layers: base overlay; }
     Header { background: #1a1a1a; color: #ff8c00; }
     Footer { background: #1a1a1a; color: #999999; }
     #app-body { height: 1fr; background: #000000; }
-    #boot-panel { height: 1fr; background: #000000; padding: 1 2; }
+    #boot-panel { layer: overlay; width: 100%; height: 100%; background: #000000; padding: 1 2; }
     #boot-title { height: 3; color: #ff8c00; text-style: bold; }
     #boot-log { height: 1fr; background: #000000; color: #e0e0e0; border: none; }
-    #main-scroll { height: 1fr; background: #000000; }
+    #main-scroll { layer: base; height: 1fr; background: #000000; }
     .ptitle { height: 3; padding: 0 1; border: solid #333333; background: #0a0a0a; color: #ff8c00; }
     .panel { border: solid #333333; background: #0a0a0a; color: #e0e0e0; padding: 1; }
     #price-chart { height: 42; padding: 0 1; border: solid #333333; background: #000000; }
@@ -149,6 +150,11 @@ class BTCInvestorApp(App[None]):
     #settings-panel Static { width: auto; margin-right: 1; }
     .settings-row { height: 3; }
     """
+
+    _BOOT_MESSAGE_LIMIT = 9
+    _BOOT_TRANSITION_SECONDS = 3
+    _AI_WATCHDOG_SECONDS = 35.0
+    _AI_CONNECTING_ANALYSIS = "Connecting to GitHub Models..."
 
     # Reactive indicator parameters
     ema_fast_period: reactive[int] = reactive(20)
@@ -175,10 +181,15 @@ class BTCInvestorApp(App[None]):
         self.selected_indicator = "rsi"
         self.last_error: str | None = None
         self.boot_complete = False
+        self.boot_messages: list[str] = []
+        self._boot_transition_remaining = 0
+        self._ai_request_serial = 0
+        self._ai_active_serial_by_timeframe: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="app-body"):
+            yield DashboardBody(id="main-scroll")
             yield BootPanel(id="boot-panel")
         yield Footer()
 
@@ -242,6 +253,9 @@ class BTCInvestorApp(App[None]):
         missing = [path.name for path in required if not path.exists()]
         if missing:
             raise RuntimeError(f"missing: {', '.join(missing)}")
+        debug = get_runtime_debug_metadata()
+        if not debug.get("smartmoneyconcepts_file"):
+            raise RuntimeError("smartmoneyconcepts dependency unavailable")
 
     def _boot_validate_dashboard_stage(self, result: BootResult, label: str, key: str) -> None:
         self.call_from_thread(self._boot_log_start, label)
@@ -291,20 +305,29 @@ class BTCInvestorApp(App[None]):
             self.ema_slow_period,
             self.show_rsi,
             self.show_stoch,
+            self.rsi_period,
+            self.stoch_k,
+            self.stoch_d,
+            self.stoch_smooth,
+            self.macd_fast,
+            self.macd_slow,
+            self.macd_signal_p,
         )
 
     def _boot_log_start(self, label: str) -> None:
-        self._boot_log(f"[bold white][  [#ffcc00]..[/]  ][/] {escape(label)}")
+        self._boot_log(f"[bold white]•[/] [#ffcc00]..[/] {escape(label)}")
 
     def _boot_log_ok(self, label: str) -> None:
-        self._boot_log(f"[bold #00ff88][  OK  ][/] {escape(label)}")
+        self._boot_log(f"[bold #00ff88]✓ OK[/] {escape(label)}")
 
     def _boot_log_failed(self, label: str, message: str) -> None:
-        self._boot_log(f"[bold #ff4444][ FAILED ][/] {escape(label)} [#777777]({escape(message)})[/]")
+        self._boot_log(f"[bold #ff4444]✗ FAILED[/] {escape(label)} [#777777]({escape(message)})[/]")
 
     def _boot_log(self, markup: str) -> None:
+        self.boot_messages.append(markup)
+        self.boot_messages = self.boot_messages[-self._BOOT_MESSAGE_LIMIT:]
         try:
-            self.query_one("#boot-log", RichLog).write(Text.from_markup(markup))
+            self.query_one("#boot-log", Static).update("\n".join(self.boot_messages))
         except Exception:
             pass
 
@@ -313,29 +336,62 @@ class BTCInvestorApp(App[None]):
         self.macro_data = result.macro_data
         self.boot_chart_png = result.chart_png
         self.last_error = "; ".join(result.errors) if result.errors and not result.dashboard_data else None
-        self._boot_log("[#666666]Switching to dashboard in 1s...[/]")
-        self.set_timer(1.0, self._switch_to_dashboard_after_boot)
+        self._boot_log("[#666666]Preparing dashboard behind boot screen...[/]")
+        self._prepare_dashboard_for_reveal()
 
-    async def _switch_to_dashboard_after_boot(self) -> None:
+    def _prepare_dashboard_for_reveal(self) -> None:
         try:
-            await self._mount_dashboard_after_boot()
+            self._render_dashboard()
+        except Exception as exc:
+            self._boot_log_failed("Prepare Dashboard", str(exc))
+            return
+        self._start_boot_transition_countdown()
+
+    def _start_boot_transition_countdown(self) -> None:
+        self._boot_transition_remaining = self._BOOT_TRANSITION_SECONDS
+        self._boot_log_transition(self._boot_transition_remaining)
+
+        def countdown() -> None:
+            worker = get_current_worker()
+            while self._boot_transition_remaining > 0:
+                time.sleep(1.0)
+                if worker.is_cancelled:
+                    return
+                self.call_from_thread(self._tick_boot_transition_countdown)
+
+        self.run_worker(countdown, name="boot-transition", group="boot-transition", exclusive=True, thread=True, exit_on_error=False)
+
+    def _tick_boot_transition_countdown(self) -> None:
+        self._boot_transition_remaining -= 1
+        if self._boot_transition_remaining <= 0:
+            self._boot_transition_remaining = 0
+            self._reveal_dashboard_after_boot()
+            return
+        self._boot_log_transition(self._boot_transition_remaining)
+
+    def _boot_log_transition(self, seconds_remaining: int) -> None:
+        markup = f"[#666666]Dashboard launch in {seconds_remaining}s...[/]"
+        if self.boot_messages and self.boot_messages[-1].startswith("[#666666]Dashboard launch in "):
+            self.boot_messages[-1] = markup
+            try:
+                self.query_one("#boot-log", Static).update("\n".join(self.boot_messages))
+            except Exception:
+                pass
+            return
+        self._boot_log(markup)
+
+    def _reveal_dashboard_after_boot(self) -> None:
+        try:
+            self._remove_boot_overlay()
         except Exception as exc:
             self._boot_log_failed("Mount Dashboard", str(exc))
 
-    async def _mount_dashboard_after_boot(self) -> None:
+    def _remove_boot_overlay(self) -> None:
         body = self.query_one("#app-body", Vertical)
-        for existing in list(body.query("#main-scroll")):
-            await existing.remove()
-        dashboard = DashboardBody(id="main-scroll")
-        await body.mount(dashboard)
         self.boot_complete = True
-        await self._dashboard_mounted_after_boot()
         for boot_panel in list(body.query("#boot-panel")):
-            await boot_panel.remove()
+            boot_panel.display = False
         body.refresh(layout=True)
-
-    async def _dashboard_mounted_after_boot(self) -> None:
-        self._render_dashboard()
         if self.dashboard_data and _get_token():
             self._start_ai_commentary()
 
@@ -447,7 +503,25 @@ class BTCInvestorApp(App[None]):
             )
             if new_series and "technical" in section:
                 section["technical"]["indicator_series"] = new_series
+                self._update_latest_indicator_values(section["technical"], new_series)
         self._render_plots()
+
+    def _update_latest_indicator_values(self, technical: Payload, series: Payload) -> None:
+        moving = technical.get("moving_averages")
+        if not isinstance(moving, dict):
+            moving = {}
+            technical["moving_averages"] = moving
+        moving["ema_20"] = _latest_series_value(series.get("ema_20"))
+        moving["ema_50"] = _latest_series_value(series.get("ema_50"))
+
+        oscillators = technical.get("oscillators")
+        if not isinstance(oscillators, dict):
+            oscillators = {}
+            technical["oscillators"] = oscillators
+        oscillators["rsi_14"] = _latest_series_value(series.get("rsi_14"))
+        oscillators["macd"] = _latest_series_value(series.get("macd"))
+        oscillators["macd_signal"] = _latest_series_value(series.get("macd_signal"))
+        oscillators["macd_histogram"] = _latest_series_value(series.get("macd_histogram"))
 
     # ─── Reactive watchers ────────────────────────────────────────────────────
 
@@ -501,20 +575,52 @@ class BTCInvestorApp(App[None]):
     def _start_ai_commentary(self) -> None:
         if not self.dashboard_data:
             return
-        self._update_status("Fetching AI order block commentary...")
+        self._update_status("AI commentary request sent; terminal remains live...")
         tf = self.selected_timeframe
         data = self.dashboard_data
+        self._ai_request_serial += 1
+        request_serial = self._ai_request_serial
+        self._ai_active_serial_by_timeframe[tf] = request_serial
+        self.ai_commentary_data[tf] = {
+            "buy_zones": [],
+            "sell_zones": [],
+            "analysis": self._AI_CONNECTING_ANALYSIS,
+            "commentary": "",
+        }
+        self._render_ai_analysis()
+        self.set_timer(
+            self._AI_WATCHDOG_SECONDS,
+            lambda tf=tf, serial=request_serial: self._ai_commentary_watchdog(tf, serial),
+        )
 
         def fetch_ai() -> None:
             worker = get_current_worker()
-            section = data.get(tf)
-            candles = section.get("candles", []) if isinstance(section, dict) else []
-            order_blocks = section.get("order_blocks", {}) if isinstance(section, dict) else {}
-            if not candles:
-                return
-            commentary = get_order_block_commentary(candles, "1W" if tf == "weekly" else "1D", order_blocks)
+            try:
+                section = data.get(tf)
+                candles = section.get("candles", []) if isinstance(section, dict) else []
+                order_blocks = section.get("order_blocks", {}) if isinstance(section, dict) else {}
+                if not candles:
+                    commentary = {
+                        "buy_zones": [],
+                        "sell_zones": [],
+                        "analysis": "AI commentary unavailable: no candle data for this timeframe.",
+                        "commentary": "",
+                    }
+                else:
+                    commentary = get_order_block_commentary(
+                        candles,
+                        "1W" if tf == "weekly" else "1D",
+                        order_blocks if isinstance(order_blocks, dict) else {},
+                    )
+            except Exception as exc:
+                commentary = {
+                    "buy_zones": [],
+                    "sell_zones": [],
+                    "analysis": f"AI commentary error: {type(exc).__name__}: {exc}",
+                    "commentary": "",
+                }
             if not worker.is_cancelled:
-                self.call_from_thread(self._ai_commentary_received, tf, commentary)
+                self.call_from_thread(self._ai_commentary_received, tf, request_serial, commentary)
 
         self.run_worker(fetch_ai, name="ai", group="ai", exclusive=True, thread=True, exit_on_error=False)
 
@@ -544,9 +650,41 @@ class BTCInvestorApp(App[None]):
 
         self.run_worker(fetch_macro, name="macro", group="macro", exclusive=True, thread=True, exit_on_error=False)
 
-    def _ai_commentary_received(self, timeframe: str, commentary: Payload) -> None:
+    def _ai_commentary_watchdog(self, timeframe: str, request_serial: int) -> None:
+        if self._ai_active_serial_by_timeframe.get(timeframe) != request_serial:
+            return
+        commentary = self.ai_commentary_data.get(timeframe, {})
+        analysis = str(commentary.get("analysis") or "") if isinstance(commentary, dict) else ""
+        if analysis != self._AI_CONNECTING_ANALYSIS:
+            return
+        self.ai_commentary_data[timeframe] = {
+            "buy_zones": [],
+            "sell_zones": [],
+            "analysis": (
+                f"AI commentary still has no response after {int(self._AI_WATCHDOG_SECONDS)}s. "
+                "Press A to retry; check token/network if this repeats."
+            ),
+            "commentary": "",
+        }
+        self._render_dashboard()
+        tf_label = "1W" if timeframe == "weekly" else "1D"
+        self._update_status(f"{tf_label} AI commentary timed out locally; press A to retry")
+
+    def _ai_commentary_received(self, timeframe: str, request_serial: int, commentary: Payload) -> None:
+        if self._ai_active_serial_by_timeframe.get(timeframe) != request_serial:
+            return
         self.ai_commentary_data[timeframe] = commentary
         self._render_dashboard()
+        analysis = str(commentary.get("analysis") or "") if isinstance(commentary, dict) else ""
+        tf_label = "1W" if timeframe == "weekly" else "1D"
+        if (
+            analysis.startswith("AI commentary")
+            or analysis.startswith("AI connection failed")
+            or analysis.startswith("⚠")
+        ):
+            self._update_status(f"{tf_label} AI commentary unavailable: {analysis}")
+        else:
+            self._update_status(f"{tf_label} AI commentary ready")
 
     def _macro_received(self, data: Payload) -> None:
         self.macro_data = data
@@ -587,6 +725,8 @@ class BTCInvestorApp(App[None]):
             self.dashboard_data, self.macro_data, self.selected_timeframe, self.selected_indicator,
             order_blocks, self.show_ema_fast, self.show_ema_slow,
             self.ema_fast_period, self.ema_slow_period, self.show_rsi, self.show_stoch,
+            self.rsi_period, self.stoch_k, self.stoch_d, self.stoch_smooth,
+            self.macd_fast, self.macd_slow, self.macd_signal_p,
             self.boot_chart_png,
         )
         self.boot_chart_png = None
@@ -614,6 +754,11 @@ class BTCInvestorApp(App[None]):
             blocks = {}
         commentary = self.ai_commentary_data.get(self.selected_timeframe, {})
         lines = ["[bold #ff8c00]═══ ORDER BLOCKS / AI COMMENTARY ═══[/]"]
+        debug = self.dashboard_data.get("runtime_debug") if isinstance(self.dashboard_data, dict) else None
+        if isinstance(debug, dict):
+            mode = "repo" if debug.get("running_from_project") else "external"
+            smc_version = debug.get("smartmoneyconcepts_version") or "missing"
+            lines.append(f"[#555555]runtime: {escape(mode)} | smc: {escape(str(smc_version))}[/]")
         unmitigated = blocks.get("unmitigated") if isinstance(blocks.get("unmitigated"), list) else []
         if unmitigated:
             for block in unmitigated[:6]:
@@ -622,7 +767,9 @@ class BTCInvestorApp(App[None]):
                 color = "#00ff88" if block.get("type") == "bullish" else "#ff4444"
                 side = "DEMAND" if block.get("type") == "bullish" else "SUPPLY"
                 label = escape(str(block.get("origin_date") or ""))
-                lines.append(f"  [{color}]█ {side}[/] {_fmt_usd(block.get('price_low'))} - {_fmt_usd(block.get('price_high'))}  [#666]{label}[/]")
+                meta = _format_order_block_meta(block)
+                suffix = f" {meta}" if meta else ""
+                lines.append(f"  [{color}]█ {side}[/] {_fmt_usd(block.get('price_low'))} - {_fmt_usd(block.get('price_high'))}  [#666]{label}{suffix}[/]")
         else:
             lines.append("[#666666]No recent unmitigated order blocks detected.[/]")
         analysis = commentary.get("analysis", "") if isinstance(commentary, dict) else ""
@@ -682,7 +829,7 @@ class BTCInvestorApp(App[None]):
             f" Price  [bold #fff]{_fmt_usd(market.get('price') or quote.get('price'))}[/]  {_fmt_pct(quote.get('change_pct'))}",
             f" Trend  [#ffcc00]{escape(_fmt_label(technical.get('trend_label')))}[/]  Risk [#ff6666]{escape(_fmt_label(technical.get('risk_label')))}[/]",
             f" EMA{self.ema_fast_period} [#fff]{_fmt_usd(moving.get('ema_20'))}[/]  EMA{self.ema_slow_period} [#fff]{_fmt_usd(moving.get('ema_50'))}[/]",
-            f" RSI{self.rsi_period} [#00ccff]{_fmt_num(osc.get('rsi_14'))}[/]  MACD [#fff]{_fmt_num(osc.get('macd'))}[/]",
+            f" RSI{self.rsi_period} [#00ccff]{_fmt_num(osc.get('rsi_14'))}[/]  MACD({self.macd_fast},{self.macd_slow},{self.macd_signal_p}) [#fff]{_fmt_num(osc.get('macd'))}[/]",
         ]
         panel.update("\n".join(lines))
 
@@ -710,9 +857,13 @@ class BTCInvestorApp(App[None]):
             text.append(f"{title}\n", style=f"underline link {url}" if url.startswith("http") else "")
             line_links.append(url if url.startswith("http") else None)
 
+        text.append("\n═══ REDDIT ═══\n", style="bold #ff8c00")
+        line_links.extend([None, None])
+        sentiment_label = str(sentiment.get("sentiment_label") or "unavailable") if isinstance(sentiment, dict) else "unavailable"
+        posts_analyzed = sentiment.get("posts_analyzed") if isinstance(sentiment, dict) else 0
+        text.append(f" sentiment: {sentiment_label} | posts: {posts_analyzed or 0}\n", style="#888888")
+        line_links.append(None)
         if posts:
-            text.append("\n═══ REDDIT ═══\n", style="bold #ff8c00")
-            line_links.extend([None, None])
             for post in posts[:3]:
                 if not isinstance(post, dict):
                     continue
@@ -720,6 +871,11 @@ class BTCInvestorApp(App[None]):
                 url = str(post.get("url") or "")
                 text.append(f" {title}\n", style=f"underline link {url}" if url.startswith("http") else "")
                 line_links.append(url if url.startswith("http") else None)
+        else:
+            error = sentiment.get("error") if isinstance(sentiment, dict) else None
+            message = f"Reddit unavailable: {error}" if error else "No Reddit posts returned right now."
+            text.append(f" {message}\n", style="#666666")
+            line_links.append(None)
 
         if not items and not posts:
             text.append("No news available\n", style="#666666")
@@ -742,6 +898,18 @@ class BTCInvestorApp(App[None]):
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _format_order_block_meta(block: Payload) -> str:
+    parts: list[str] = []
+    age = block.get("age_candles")
+    distance = block.get("distance_pct")
+    if isinstance(age, int):
+        parts.append(f"{age} bars")
+    distance_value = float(distance) if isinstance(distance, (int, float, str)) else math.nan
+    if math.isfinite(distance_value):
+        parts.append(f"{distance_value * 100:.0f}% away")
+    return f"({' · '.join(parts)})" if parts else ""
 
 
 def _fmt_usd(v: Any) -> str:
@@ -769,6 +937,19 @@ def _fmt_num(v: Any, d: int = 2) -> str:
     except (TypeError, ValueError):
         return "n/a"
     return f"{n:,.{d}f}" if math.isfinite(n) else "n/a"
+
+
+def _latest_series_value(values: Any) -> float | None:
+    if not isinstance(values, list):
+        return None
+    for value in reversed(values):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
 
 
 def _fmt_label(v: Any) -> str:

@@ -212,6 +212,13 @@ def build_indicator_chart(
     height: int,
     show_rsi: bool = True,
     show_stoch: bool = True,
+    rsi_period: int = 14,
+    stoch_k_period: int = 5,
+    stoch_d_period: int = 3,
+    stoch_smooth_period: int = 3,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
 ) -> str:
     """Render RSI/Stoch combined or MACD indicator chart."""
     max_points = min(len(candles), max(40, width // 2))
@@ -225,15 +232,39 @@ def build_indicator_chart(
     tf_label = "1W" if timeframe == "weekly" else "1D"
 
     if indicator == "macd":
-        return _build_macd(rows, n, canvas_w, canvas_h, tf_label)
+        return _build_macd(rows, n, canvas_w, canvas_h, tf_label, macd_fast, macd_slow, macd_signal)
 
     # RSI or Stoch view
     if not show_rsi and not show_stoch:
         return f"  {tf_label} Oscillators disabled"
-    return _build_rsi_stoch(rows, n, canvas_w, canvas_h, tf_label, show_rsi, show_stoch)
+    return _build_rsi_stoch(
+        rows,
+        n,
+        canvas_w,
+        canvas_h,
+        tf_label,
+        show_rsi,
+        show_stoch,
+        rsi_period,
+        stoch_k_period,
+        stoch_d_period,
+        stoch_smooth_period,
+    )
 
 
-def _build_rsi_stoch(rows: dict, n: int, canvas_w: int, canvas_h: int, tf_label: str, show_rsi: bool, show_stoch: bool) -> str:
+def _build_rsi_stoch(
+    rows: dict,
+    n: int,
+    canvas_w: int,
+    canvas_h: int,
+    tf_label: str,
+    show_rsi: bool,
+    show_stoch: bool,
+    rsi_period: int,
+    stoch_k_period: int,
+    stoch_d_period: int,
+    stoch_smooth_period: int,
+) -> str:
     """Render RSI and/or Stochastic in one chart (0-100 scale)."""
     c = plotille.Canvas(width=canvas_w, height=canvas_h, xmin=0, xmax=n, ymin=0, ymax=100)
 
@@ -245,14 +276,19 @@ def _build_rsi_stoch(rows: dict, n: int, canvas_w: int, canvas_h: int, tf_label:
     legend = []
     if show_rsi:
         _draw_series_line(c, rows["rsi_14"], _CYAN)
-        legend.append("\033[38;2;100;200;255m─ RSI\033[0m")
+        legend.append(f"\033[38;2;100;200;255m─ RSI{rsi_period}\033[0m")
     if show_stoch:
         _draw_series_line(c, rows["stoch_k"], _YELLOW)
         _draw_series_line(c, rows["stoch_d"], "magenta")
-        legend.append("\033[38;2;255;200;50m─ %K\033[0m")
-        legend.append("\033[35m─ %D\033[0m")
+        legend.append(f"\033[38;2;255;200;50m─ %K{stoch_k_period}\033[0m")
+        legend.append(f"\033[35m─ %D{stoch_d_period}\033[0m")
 
-    title = f"  {tf_label} │ {'  '.join(legend)}  \033[31m── 70\033[0m  \033[32m── 30\033[0m"
+    title_parts = []
+    if show_rsi:
+        title_parts.append(f"RSI{rsi_period}")
+    if show_stoch:
+        title_parts.append(f"Stoch {stoch_k_period}-{stoch_d_period}-{stoch_smooth_period}")
+    title = f"  {tf_label} {' / '.join(title_parts)} │ {'  '.join(legend)}  \033[31m── 70\033[0m  \033[32m── 30\033[0m"
     canvas_lines = c.plot().split("\n")
     n_lines = len(canvas_lines)
 
@@ -266,7 +302,7 @@ def _build_rsi_stoch(rows: dict, n: int, canvas_w: int, canvas_h: int, tf_label:
     return "\n".join(output_lines)
 
 
-def _build_macd(rows: dict, n: int, canvas_w: int, canvas_h: int, tf_label: str) -> str:
+def _build_macd(rows: dict, n: int, canvas_w: int, canvas_h: int, tf_label: str, macd_fast: int, macd_slow: int, macd_signal: int) -> str:
     """Render MACD chart with signal and histogram."""
     # Determine Y range from MACD values
     all_vals = []
@@ -303,7 +339,7 @@ def _build_macd(rows: dict, n: int, canvas_w: int, canvas_h: int, tf_label: str)
     _draw_series_line(c, rows["macd"], _CYAN)
     _draw_series_line(c, rows["macd_signal"], _YELLOW)
 
-    title = f"  {tf_label} MACD │ \033[38;2;100;200;255m─ MACD\033[0m  \033[38;2;255;200;50m─ Signal\033[0m  \033[38;2;38;166;91m▌\033[0m\033[38;2;239;57;74m▌ Hist\033[0m"
+    title = f"  {tf_label} MACD {macd_fast}-{macd_slow}-{macd_signal} │ \033[38;2;100;200;255m─ MACD {macd_fast}/{macd_slow}\033[0m  \033[38;2;255;200;50m─ Signal {macd_signal}\033[0m  \033[38;2;38;166;91m▌\033[0m\033[38;2;239;57;74m▌ Hist\033[0m"
     canvas_lines = c.plot().split("\n")
     n_lines = len(canvas_lines)
 
