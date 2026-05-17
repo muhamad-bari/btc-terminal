@@ -1,7 +1,7 @@
 """Data aggregation layer for a standalone BTC long-term investor TUI.
 
 This module intentionally avoids MCP, OpenClaw, JSON-RPC, and AI prompt code.
-It prepares plain Python payloads that a future Textual/plotext UI can render.
+It prepares plain Python payloads that the Textual UI can render.
 """
 
 from __future__ import annotations
@@ -57,6 +57,8 @@ DEFAULT_WEEKLY_INTERVAL = "1wk"
 DEFAULT_ORDER_BLOCK_PIVOT_LEFT = 2
 DEFAULT_ORDER_BLOCK_PIVOT_RIGHT = 2
 DEFAULT_ORDER_BLOCK_LIMIT = 8
+DEFAULT_ORDER_BLOCK_IMPULSE_LOOKBACK = 20
+DEFAULT_ORDER_BLOCK_ORIGIN_LOOKBACK = 6
 
 _NEWS_USER_AGENT = (
     "Mozilla/5.0 (compatible; btc-investor-tui/0.1; "
@@ -259,35 +261,29 @@ def detect_order_blocks(
     mitigation: str = "wick",
     max_blocks: int = DEFAULT_ORDER_BLOCK_LIMIT,
 ) -> dict[str, Any]:
-    """Detect deterministic volume-pivot BTC order blocks.
-
-    A bearish volume-pivot candle followed by a break above its high becomes a
-    bullish demand block. A bullish volume-pivot candle followed by a break
-    below its low becomes a bearish supply block. Mitigation is evaluated after
-    the confirming break using either wick or close interaction with the block.
-    """
-    if pivot_left < 1 or pivot_right < 1:
-        raise ValueError("pivot_left and pivot_right must be >= 1")
+    """Detect the last opposite candle before a strong BTC price impulse."""
     if mitigation not in {"wick", "close"}:
         raise ValueError("mitigation must be 'wick' or 'close'")
 
     blocks: list[dict[str, Any]] = []
-    if len(candles) < pivot_left + pivot_right + 2:
+    used_origins: set[int] = set()
+    if len(candles) < 8:
         return _order_block_payload(blocks, mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
 
-    for index in range(pivot_left, len(candles) - pivot_right):
-        pivot = _normalized_order_block_candle(candles[index], index)
-        if pivot is None or not _is_volume_pivot(candles, index, pivot_left, pivot_right):
+    for index in range(3, len(candles)):
+        impulse = _normalized_order_block_candle(candles[index], index)
+        if impulse is None or not _is_impulsive_move(candles, index):
             continue
 
-        if pivot["close"] < pivot["open"]:
-            confirmation = _find_bullish_confirmation(candles, index, pivot_right)
-            if confirmation is not None:
-                blocks.append(_build_order_block(candles, pivot, confirmation, "bullish", mitigation))
-        elif pivot["close"] > pivot["open"]:
-            confirmation = _find_bearish_confirmation(candles, index, pivot_right)
-            if confirmation is not None:
-                blocks.append(_build_order_block(candles, pivot, confirmation, "bearish", mitigation))
+        impulse_type = "bullish" if impulse["close"] > impulse["open"] else "bearish"
+        origin_index = _find_last_opposite_candle(candles, index, impulse_type)
+        if origin_index is None or origin_index in used_origins:
+            continue
+        origin = _normalized_order_block_candle(candles[origin_index], origin_index)
+        if origin is None:
+            continue
+        blocks.append(_build_impulsive_order_block(candles, origin, impulse, impulse_type, mitigation))
+        used_origins.add(origin_index)
 
     return _order_block_payload(blocks, mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
 
@@ -344,7 +340,7 @@ def get_btc_dashboard_data(
     news_limit: int = 12,
     sentiment_limit: int = 30,
 ) -> dict[str, Any]:
-    """Aggregate all data needed by the future Textual/plotext dashboard."""
+    """Aggregate all data needed by the Textual investor dashboard."""
     optional_errors: dict[str, str] = {}
     try:
         weekly_candles = get_btc_candles(period=weekly_period, interval=DEFAULT_WEEKLY_INTERVAL)
@@ -456,9 +452,9 @@ def _normalized_order_block_candle(candle: dict[str, Any], index: int) -> dict[s
     low_price = _finite_float(candle.get("low"))
     close_price = _finite_float(candle.get("close"))
     volume = _finite_float(candle.get("volume"))
-    if open_price is None or high_price is None or low_price is None or close_price is None or volume is None:
+    if open_price is None or high_price is None or low_price is None or close_price is None:
         return None
-    if volume <= 0 or high_price < low_price:
+    if high_price < low_price:
         return None
     return {
         "index": index,
@@ -467,7 +463,91 @@ def _normalized_order_block_candle(candle: dict[str, Any], index: int) -> dict[s
         "high": high_price,
         "low": low_price,
         "close": close_price,
-        "volume": volume,
+        "volume": volume or 0.0,
+    }
+
+
+def _is_impulsive_move(candles: list[dict[str, Any]], index: int) -> bool:
+    current = _normalized_order_block_candle(candles[index], index)
+    if current is None or current["close"] == current["open"]:
+        return False
+
+    start = max(0, index - DEFAULT_ORDER_BLOCK_IMPULSE_LOOKBACK)
+    prior = [_normalized_order_block_candle(candles[i], i) for i in range(start, index)]
+    prior = [candle for candle in prior if candle is not None]
+    if len(prior) < 3:
+        return False
+
+    body = abs(current["close"] - current["open"])
+    candle_range = current["high"] - current["low"]
+    if candle_range <= 0:
+        return False
+
+    bodies = [abs(candle["close"] - candle["open"]) for candle in prior]
+    ranges = [candle["high"] - candle["low"] for candle in prior if candle["high"] > candle["low"]]
+    avg_body = sum(bodies) / len(bodies) if bodies else 0
+    avg_range = sum(ranges) / len(ranges) if ranges else 0
+    if avg_body <= 0 or avg_range <= 0:
+        return False
+
+    body_ratio = body / candle_range
+    strong_body = body >= avg_body * 1.8
+    wide_range = candle_range >= avg_range * 1.15
+    previous_high = max(candle["high"] for candle in prior[-5:])
+    previous_low = min(candle["low"] for candle in prior[-5:])
+
+    if current["close"] > current["open"]:
+        closes_near_extreme = (current["high"] - current["close"]) / candle_range <= 0.35
+        breaks_structure = current["close"] > previous_high
+        return strong_body and closes_near_extreme and (wide_range or breaks_structure or body_ratio >= 0.7)
+
+    closes_near_extreme = (current["close"] - current["low"]) / candle_range <= 0.35
+    breaks_structure = current["close"] < previous_low
+    return strong_body and closes_near_extreme and (wide_range or breaks_structure or body_ratio >= 0.7)
+
+
+def _find_last_opposite_candle(candles: list[dict[str, Any]], impulse_index: int, impulse_type: str) -> int | None:
+    start = max(0, impulse_index - DEFAULT_ORDER_BLOCK_ORIGIN_LOOKBACK)
+    for index in range(impulse_index - 1, start - 1, -1):
+        candle = _normalized_order_block_candle(candles[index], index)
+        if candle is None or candle["close"] == candle["open"]:
+            continue
+        if impulse_type == "bullish" and candle["close"] < candle["open"]:
+            return index
+        if impulse_type == "bearish" and candle["close"] > candle["open"]:
+            return index
+    return None
+
+
+def _build_impulsive_order_block(
+    candles: list[dict[str, Any]],
+    origin: dict[str, Any],
+    impulse: dict[str, Any],
+    block_type: str,
+    mitigation: str,
+) -> dict[str, Any]:
+    price_low = origin["low"]
+    price_high = origin["high"]
+    label = "Bullish impulsive-move demand block" if block_type == "bullish" else "Bearish impulsive-move supply block"
+    mitigated_index = _find_mitigation_index(candles, impulse["index"] + 1, block_type, price_low, price_high, mitigation)
+    return {
+        "type": block_type,
+        "price_low": _round_price(price_low),
+        "price_high": _round_price(price_high),
+        "origin_index": origin["index"],
+        "origin_date": origin["date"],
+        "created_index": impulse["index"],
+        "created_date": impulse["date"],
+        "volume": int(origin["volume"]),
+        "mitigated": mitigated_index is not None,
+        "mitigated_index": mitigated_index,
+        "mitigated_date": str(candles[mitigated_index].get("date", "")) if mitigated_index is not None else None,
+        "mitigation_mode": mitigation,
+        "detector": "impulsive_move",
+        "impulse_index": impulse["index"],
+        "impulse_date": impulse["date"],
+        "impulse_close": _round_price(impulse["close"]),
+        "label": label,
     }
 
 
@@ -581,6 +661,7 @@ def _order_block_payload(
     bullish = [block for block in recent if block.get("type") == "bullish"]
     bearish = [block for block in recent if block.get("type") == "bearish"]
     return {
+        "detector": "impulsive_move",
         "mitigation_mode": mitigation,
         "pivot_left": pivot_left,
         "pivot_right": pivot_right,

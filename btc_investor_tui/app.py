@@ -1,15 +1,13 @@
 """Textual dashboard for long-term Bitcoin investors.
 
-    Bloomberg-style terminal with dynamic indicators, order blocks, and macro intel.
+    Terminal dashboard with dynamic indicators, order blocks, and macro intel.
 """
 
 from __future__ import annotations
 
 import math
-import os
 import sys
 import webbrowser
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,86 +27,10 @@ if __package__ in (None, ""):
 
 from btc_investor_tui.data_engine import get_btc_dashboard_data, recalculate_indicators
 from btc_investor_tui.ai_zones import get_order_block_commentary, _get_token, save_token
-from btc_investor_tui.chart_renderer import build_price_chart, build_indicator_chart
 from btc_investor_tui.macro_intel import get_macro_intel
+from btc_investor_tui.pixel_chart import ImageChartCanvas
 
 Payload = dict[str, Any]
-
-
-class PlotCanvas(Static):
-    """Braille chart canvas widget."""
-
-    def __init__(self, *, mode: str, **kwargs: Any) -> None:
-        super().__init__("", markup=False, **kwargs)
-        self.mode = mode
-        self._data: Payload | None = None
-        self._timeframe = "weekly"
-        self._indicator = "rsi"
-        self._order_blocks: Payload | None = None
-        self._ema_fast_on = True
-        self._ema_slow_on = True
-        self._ema_fast_p = 20
-        self._ema_slow_p = 50
-        self._show_rsi = True
-        self._show_stoch = True
-
-    def set_state(
-        self,
-        data: Payload | None,
-        timeframe: str,
-        indicator: str,
-        order_blocks: Payload | None = None,
-        ema_fast_on: bool = True,
-        ema_slow_on: bool = True,
-        ema_fast_p: int = 20,
-        ema_slow_p: int = 50,
-        show_rsi: bool = True,
-        show_stoch: bool = True,
-    ) -> None:
-        self._data = data
-        self._timeframe = timeframe
-        self._indicator = indicator
-        self._order_blocks = order_blocks
-        self._ema_fast_on = ema_fast_on
-        self._ema_slow_on = ema_slow_on
-        self._ema_fast_p = ema_fast_p
-        self._ema_slow_p = ema_slow_p
-        self._show_rsi = show_rsi
-        self._show_stoch = show_stoch
-        self._render_plot()
-
-    def on_resize(self) -> None:
-        self._render_plot()
-
-    def _render_plot(self) -> None:
-        if not self._data:
-            self.update(Text("Loading...", style="bold yellow"))
-            return
-        section = self._data.get(self._timeframe)
-        if not isinstance(section, dict):
-            self.update(Text("No data", style="bold red"))
-            return
-        candles = section.get("candles", [])
-        technical = section.get("technical", {})
-        if not candles:
-            self.update(Text("No candles", style="bold red"))
-            return
-
-        width = max(48, self.size.width - 2)
-        if self.mode == "indicator" or self.mode == "stoch":
-            height = max(8, self.size.height - 1)
-            txt = build_indicator_chart(
-                candles, technical, self._timeframe, self._indicator, width, height,
-                show_rsi=self._show_rsi, show_stoch=self._show_stoch,
-            )
-        else:
-            height = max(14, self.size.height - 1)
-            txt = build_price_chart(
-                candles, technical, self._timeframe, width, height,
-                self._order_blocks, self._ema_fast_on, self._ema_slow_on,
-                self._ema_fast_p, self._ema_slow_p,
-            )
-        self.update(Text.from_ansi(txt))
 
 
 class NewsPanel(Static):
@@ -139,7 +61,7 @@ class NewsPanel(Static):
 
 
 class BTCInvestorApp(App[None]):
-    """Bloomberg-style BTC investor terminal with dynamic indicators."""
+    """BTC investor terminal with dynamic indicators."""
 
     TITLE = "BTC INVESTOR TERMINAL"
     SUB_TITLE = "BTC-USDT · Dynamic Indicators · Order Blocks · Macro Intel"
@@ -160,9 +82,7 @@ class BTCInvestorApp(App[None]):
     #main-scroll { background: #000000; }
     .ptitle { height: 3; padding: 0 1; border: solid #333333; background: #0a0a0a; color: #ff8c00; }
     .panel { border: solid #333333; background: #0a0a0a; color: #e0e0e0; padding: 1; }
-    #price-chart { height: 24; padding: 0 1; border: solid #333333; background: #000000; }
-    #indicator-chart { height: 12; padding: 0 1; border: solid #333333; background: #000000; }
-    #stoch-chart { height: 12; padding: 0 1; border: solid #333333; background: #000000; }
+    #price-chart { height: 42; padding: 0 1; border: solid #333333; background: #000000; }
     #ai-analysis { height: auto; min-height: 4; padding: 1; border: solid #444400; background: #0a0a00; }
     #macro-intel { height: auto; min-height: 4; padding: 1; border: solid #003344; background: #000a0f; }
     #status-strip { height: 3; padding: 0 1; border: solid #333333; background: #0a0a0a; color: #ff8c00; }
@@ -225,9 +145,7 @@ class BTCInvestorApp(App[None]):
                     yield Input(value="12", id="inp-macd-fast", placeholder="12")
                     yield Input(value="26", id="inp-macd-slow", placeholder="26")
                     yield Input(value="9", id="inp-macd-sig", placeholder="9")
-            yield PlotCanvas(mode="price", id="price-chart")
-            yield PlotCanvas(mode="indicator", id="indicator-chart")
-            yield PlotCanvas(mode="stoch", id="stoch-chart")
+            yield ImageChartCanvas(id="price-chart")
             yield Static("", id="ai-analysis")
             yield Static("", id="macro-intel")
             yield Static("", id="market-summary", classes="panel")
@@ -449,6 +367,7 @@ class BTCInvestorApp(App[None]):
 
     def _macro_received(self, data: Payload) -> None:
         self.macro_data = data
+        self._render_plots()
         self._render_macro()
 
     def _refresh_succeeded(self, data: Payload) -> None:
@@ -481,30 +400,11 @@ class BTCInvestorApp(App[None]):
             if isinstance(section, dict):
                 blocks = section.get("order_blocks")
                 order_blocks = blocks if isinstance(blocks, dict) else None
-        self.query_one("#price-chart", PlotCanvas).set_state(
-            self.dashboard_data, self.selected_timeframe, self.selected_indicator,
+        self.query_one("#price-chart", ImageChartCanvas).set_state(
+            self.dashboard_data, self.macro_data, self.selected_timeframe, self.selected_indicator,
             order_blocks, self.show_ema_fast, self.show_ema_slow,
-            self.ema_fast_period, self.ema_slow_period,
+            self.ema_fast_period, self.ema_slow_period, self.show_rsi, self.show_stoch,
         )
-        # RSI chart
-        rsi_canvas = self.query_one("#indicator-chart", PlotCanvas)
-        rsi_canvas.display = self.show_rsi and self.selected_indicator == "rsi"
-        rsi_canvas.set_state(
-            self.dashboard_data, self.selected_timeframe, "rsi",
-            show_rsi=True, show_stoch=False,
-        )
-        # Stoch chart
-        stoch_canvas = self.query_one("#stoch-chart", PlotCanvas)
-        stoch_canvas.display = self.show_stoch and self.selected_indicator == "rsi"
-        stoch_canvas.set_state(
-            self.dashboard_data, self.selected_timeframe, "stoch",
-            show_rsi=False, show_stoch=True,
-        )
-        # MACD mode: hide both RSI/Stoch, show MACD in indicator-chart
-        if self.selected_indicator == "macd":
-            rsi_canvas.display = True
-            rsi_canvas.set_state(self.dashboard_data, self.selected_timeframe, "macd")
-            stoch_canvas.display = False
 
     def _render_title(self) -> None:
         w = self.query_one("#chart-title", Static)
@@ -552,7 +452,7 @@ class BTCInvestorApp(App[None]):
     def _render_macro(self) -> None:
         panel = self.query_one("#macro-intel", Static)
         if not self.macro_data:
-            panel.update("[bold #ff8c00]═══ BLOOMBERG MACRO INTEL ═══[/]\n[#666666]Loading...[/]")
+            panel.update("[bold #ff8c00]═══ MACRO INTEL ═══[/]\n[#666666]Loading...[/]")
             return
         h = self.macro_data.get("halving", {})
         fg = self.macro_data.get("fear_greed", {})
@@ -568,7 +468,7 @@ class BTCInvestorApp(App[None]):
         fng_color = "#ff4444" if fng_val and fng_val < 30 else "#00ff88" if fng_val and fng_val > 60 else "#ffcc00"
 
         lines = [
-            "[bold #ff8c00]═══ BLOOMBERG MACRO INTEL ═══[/]",
+            "[bold #ff8c00]═══ MACRO INTEL ═══[/]",
             "",
             f" [bold]Halving #5[/]  {bar} {pct:.1f}%",
             f"   Block ~{h.get('current_block_est',0):,} / {h.get('next_halving_block',0):,}  │  [bold]{h.get('days_remaining',0)}d[/] remaining",
