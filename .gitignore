@@ -245,3 +245,4 @@ dist/
 /.cocoindex_code/
 .github_pat
 /.sisyphus/
+*AGENTS.md

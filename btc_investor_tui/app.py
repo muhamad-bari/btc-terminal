@@ -129,11 +129,11 @@ class BTCInvestorApp(App[None]):
     Screen { background: #000000; color: #e0e0e0; }
     Header { background: #1a1a1a; color: #ff8c00; }
     Footer { background: #1a1a1a; color: #999999; }
-    #app-body { background: #000000; }
-    #boot-panel { background: #000000; padding: 1 2; }
+    #app-body { height: 1fr; background: #000000; }
+    #boot-panel { height: 1fr; background: #000000; padding: 1 2; }
     #boot-title { height: 3; color: #ff8c00; text-style: bold; }
     #boot-log { height: 1fr; background: #000000; color: #e0e0e0; border: none; }
-    #main-scroll { background: #000000; }
+    #main-scroll { height: 1fr; background: #000000; }
     .ptitle { height: 3; padding: 0 1; border: solid #333333; background: #0a0a0a; color: #ff8c00; }
     .panel { border: solid #333333; background: #0a0a0a; color: #e0e0e0; padding: 1; }
     #price-chart { height: 42; padding: 0 1; border: solid #333333; background: #000000; }
@@ -314,21 +314,27 @@ class BTCInvestorApp(App[None]):
         self.boot_chart_png = result.chart_png
         self.last_error = "; ".join(result.errors) if result.errors and not result.dashboard_data else None
         self._boot_log("[#666666]Switching to dashboard in 1s...[/]")
-        self.run_worker(self._switch_to_dashboard_after_boot(), name="boot-switch", group="boot", exclusive=False, exit_on_error=False)
+        self.set_timer(1.0, self._switch_to_dashboard_after_boot)
 
     async def _switch_to_dashboard_after_boot(self) -> None:
-        await asyncio.sleep(1.0)
-        await self._mount_dashboard_after_boot()
+        try:
+            await self._mount_dashboard_after_boot()
+        except Exception as exc:
+            self._boot_log_failed("Mount Dashboard", str(exc))
 
     async def _mount_dashboard_after_boot(self) -> None:
         body = self.query_one("#app-body", Vertical)
-        await body.remove_children()
-        await body.mount(DashboardBody(id="main-scroll"))
+        for existing in list(body.query("#main-scroll")):
+            await existing.remove()
+        dashboard = DashboardBody(id="main-scroll")
+        await body.mount(dashboard)
         self.boot_complete = True
         await self._dashboard_mounted_after_boot()
+        for boot_panel in list(body.query("#boot-panel")):
+            await boot_panel.remove()
+        body.refresh(layout=True)
 
     async def _dashboard_mounted_after_boot(self) -> None:
-        await self.run_action("focus_next")
         self._render_dashboard()
         if self.dashboard_data and _get_token():
             self._start_ai_commentary()

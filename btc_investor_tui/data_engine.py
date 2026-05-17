@@ -97,6 +97,8 @@ def get_btc_candles(
             continue
 
         date = pd.Timestamp(cast(Any, index))
+        if not isinstance(date, pd.Timestamp):
+            continue
         if date.tzinfo is not None:
             date = date.tz_convert("UTC")
         candles.append(
@@ -261,31 +263,64 @@ def detect_order_blocks(
     mitigation: str = "wick",
     max_blocks: int = DEFAULT_ORDER_BLOCK_LIMIT,
 ) -> dict[str, Any]:
-    """Detect the last opposite candle before a strong BTC price impulse."""
-    if mitigation not in {"wick", "close"}:
-        raise ValueError("mitigation must be 'wick' or 'close'")
+    """Detect order blocks using Smart Money Concepts (structure-based, LuxAlgo-style).
 
-    blocks: list[dict[str, Any]] = []
-    used_origins: set[int] = set()
-    if len(candles) < 8:
+    Uses swing highs/lows to identify market structure breaks, then marks the
+    candle before the break as an order block. This avoids false OBs at irrelevant
+    historical price levels.
+    """
+    if len(candles) < 20:
+        return _order_block_payload([], mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
+
+    try:
+        from smartmoneyconcepts.smc import smc as _smc
+
+        ohlc = pd.DataFrame({
+            "open": [c["open"] for c in candles],
+            "high": [c["high"] for c in candles],
+            "low": [c["low"] for c in candles],
+            "close": [c["close"] for c in candles],
+            "volume": [c.get("volume", 0) for c in candles],
+        })
+        # swing_length=7 gives a good balance for weekly/daily BTC charts
+        swing_length = max(5, min(10, len(candles) // 15))
+        swing_hl = _smc.swing_highs_lows(ohlc, swing_length=swing_length)
+        close_mit = mitigation == "close"
+        ob_result = _smc.ob(ohlc, swing_hl, close_mitigation=close_mit)
+
+        blocks: list[dict[str, Any]] = []
+        valid = ob_result.dropna(subset=["OB"])
+        current_price = float(ohlc["close"].iloc[-1])
+        for idx, row in valid.iterrows():
+            ob_type = "bullish" if row["OB"] == 1 else "bearish"
+            mit_idx = row.get("MitigatedIndex", 0)
+            mitigated = not pd.isna(mit_idx) and mit_idx > 0
+            # Skip unmitigated OBs too far from current price (>50% away)
+            if not mitigated:
+                ob_mid = (row["Top"] + row["Bottom"]) / 2
+                distance_pct = abs(ob_mid - current_price) / current_price
+                if distance_pct > 0.50:
+                    continue
+            origin_index = int(idx)
+            blocks.append({
+                "type": ob_type,
+                "price_low": _round_price(row["Bottom"]),
+                "price_high": _round_price(row["Top"]),
+                "origin_index": origin_index,
+                "origin_date": str(candles[origin_index].get("date", "")),
+                "created_index": origin_index + 1,
+                "created_date": str(candles[min(origin_index + 1, len(candles) - 1)].get("date", "")),
+                "volume": int(row.get("OBVolume", 0) or 0),
+                "mitigated": mitigated,
+                "mitigated_index": int(mit_idx) if mitigated else None,
+                "mitigated_date": str(candles[int(mit_idx)].get("date", "")) if mitigated and int(mit_idx) < len(candles) else None,
+                "mitigation_mode": mitigation,
+                "label": f"{'Demand' if ob_type == 'bullish' else 'Supply'} OB (SMC structure)",
+            })
         return _order_block_payload(blocks, mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
-
-    for index in range(3, len(candles)):
-        impulse = _normalized_order_block_candle(candles[index], index)
-        if impulse is None or not _is_impulsive_move(candles, index):
-            continue
-
-        impulse_type = "bullish" if impulse["close"] > impulse["open"] else "bearish"
-        origin_index = _find_last_opposite_candle(candles, index, impulse_type)
-        if origin_index is None or origin_index in used_origins:
-            continue
-        origin = _normalized_order_block_candle(candles[origin_index], origin_index)
-        if origin is None:
-            continue
-        blocks.append(_build_impulsive_order_block(candles, origin, impulse, impulse_type, mitigation))
-        used_origins.add(origin_index)
-
-    return _order_block_payload(blocks, mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
+    except Exception as exc:
+        _LOGGER.warning("SMC order block detection failed, returning empty: %s", exc)
+        return _order_block_payload([], mitigation=mitigation, pivot_left=pivot_left, pivot_right=pivot_right, max_blocks=max_blocks)
 
 
 def get_btc_news(limit: int = 12) -> dict[str, Any]:
@@ -639,7 +674,7 @@ def _find_mitigation_index(
         close_price = _finite_float(candle.get("close"))
         if block_type == "bullish":
             test_price = close_price if mitigation == "close" else low_price
-            if test_price is not None and test_price <= price_high:
+            if test_price is not None and test_price < price_low:
                 return index
         else:
             test_price = close_price if mitigation == "close" else high_price
@@ -661,7 +696,7 @@ def _order_block_payload(
     bullish = [block for block in recent if block.get("type") == "bullish"]
     bearish = [block for block in recent if block.get("type") == "bearish"]
     return {
-        "detector": "impulsive_move",
+        "detector": "smc_structure",
         "mitigation_mode": mitigation,
         "pivot_left": pivot_left,
         "pivot_right": pivot_right,

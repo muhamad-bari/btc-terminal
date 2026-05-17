@@ -1,14 +1,14 @@
 [project]
-name = "tradingview-mcp-server"
+name = "btc-investor-tui"
 version = "0.7.1"
-description = "Advanced AI Trading Intelligence Framework — MCP server with walk-forward backtesting, trade logs, equity curves, 1h timeframe, sentiment, Yahoo Finance, and 30+ technical analysis tools"
+description = "Textual BTC investor terminal with pixel charts, deterministic order blocks, technical indicators, macro intel, news, and AI commentary"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-  { name = "Atila Ahmettaner" }
+  { name = "Muhamad Bari" }
 ]
-urls = { Repository = "https://github.com/atilaahmettaner/tradingview-mcp" }
-keywords = ["mcp", "tradingview", "crypto", "technical analysis", "screener", "backtesting", "walk-forward", "sentiment", "yahoo-finance", "trading", "agents", "algorithmic-trading", "equity-curve"]
+urls = { Repository = "https://github.com/muhamad-bari/btc-terminal" }
+keywords = ["bitcoin", "btc", "terminal", "tui", "textual", "technical-analysis", "order-blocks", "macro", "yahoo-finance", "investing"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -16,20 +16,15 @@ classifiers = [
 dependencies = [
   "feedparser>=6.0.12",
   "matplotlib>=3.10.0",
-  "mcp[cli]>=1.12.0",
   "pandas>=2.3.0",
   "pillow>=12.0.0",
   "ta>=0.11.0",
   "textual>=6.0.0",
   "textual-image>=0.12.0",
-  "tradingview-screener>=0.6.4",
-  "tradingview-ta>=3.3.0",
   "yfinance>=0.2.66",
 ]
 
 [project.scripts]
-# Entry point now points to packaged module
-tradingview-mcp = "tradingview_mcp.server:main"
 btc-tui = "btc_investor_tui.app:main"
 
 [tool.setuptools.packages.find]
