@@ -30,8 +30,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 tradingview_mcp = ["coinlist/*.txt"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=9.0.3",
 ]
 package = true

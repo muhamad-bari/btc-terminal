@@ -1,0 +1,648 @@
+"""Textual dashboard for long-term Bitcoin investors.
+
+Bloomberg-style terminal with dynamic indicators, AI zones, and macro intel.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from rich.markup import escape
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.reactive import reactive
+from textual.widgets import Checkbox, Footer, Header, Input, Static
+from textual.worker import get_current_worker
+
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+from btc_investor_tui.data_engine import get_btc_dashboard_data, recalculate_indicators
+from btc_investor_tui.ai_zones import get_ai_zones, _get_token, save_token
+from btc_investor_tui.chart_renderer import build_price_chart, build_indicator_chart
+from btc_investor_tui.macro_intel import get_macro_intel
+
+Payload = dict[str, Any]
+
+
+class PlotCanvas(Static):
+    """Braille chart canvas widget."""
+
+    def __init__(self, *, mode: str, **kwargs: Any) -> None:
+        super().__init__("", markup=False, **kwargs)
+        self.mode = mode
+        self._data: Payload | None = None
+        self._timeframe = "weekly"
+        self._indicator = "rsi"
+        self._ai_zones: Payload | None = None
+        self._ema_fast_on = True
+        self._ema_slow_on = True
+        self._ema_fast_p = 20
+        self._ema_slow_p = 50
+        self._show_rsi = True
+        self._show_stoch = True
+
+    def set_state(
+        self,
+        data: Payload | None,
+        timeframe: str,
+        indicator: str,
+        ai_zones: Payload | None = None,
+        ema_fast_on: bool = True,
+        ema_slow_on: bool = True,
+        ema_fast_p: int = 20,
+        ema_slow_p: int = 50,
+        show_rsi: bool = True,
+        show_stoch: bool = True,
+    ) -> None:
+        self._data = data
+        self._timeframe = timeframe
+        self._indicator = indicator
+        self._ai_zones = ai_zones
+        self._ema_fast_on = ema_fast_on
+        self._ema_slow_on = ema_slow_on
+        self._ema_fast_p = ema_fast_p
+        self._ema_slow_p = ema_slow_p
+        self._show_rsi = show_rsi
+        self._show_stoch = show_stoch
+        self._render_plot()
+
+    def on_resize(self) -> None:
+        self._render_plot()
+
+    def _render_plot(self) -> None:
+        if not self._data:
+            self.update(Text("Loading...", style="bold yellow"))
+            return
+        section = self._data.get(self._timeframe)
+        if not isinstance(section, dict):
+            self.update(Text("No data", style="bold red"))
+            return
+        candles = section.get("candles", [])
+        technical = section.get("technical", {})
+        if not candles:
+            self.update(Text("No candles", style="bold red"))
+            return
+
+        width = max(48, self.size.width - 2)
+        if self.mode == "indicator" or self.mode == "stoch":
+            height = max(8, self.size.height - 1)
+            txt = build_indicator_chart(
+                candles, technical, self._timeframe, self._indicator, width, height,
+                show_rsi=self._show_rsi, show_stoch=self._show_stoch,
+            )
+        else:
+            height = max(14, self.size.height - 1)
+            txt = build_price_chart(
+                candles, technical, self._timeframe, width, height,
+                self._ai_zones, self._ema_fast_on, self._ema_slow_on,
+                self._ema_fast_p, self._ema_slow_p,
+            )
+        self.update(Text.from_ansi(txt))
+
+
+class BTCInvestorApp(App[None]):
+    """Bloomberg-style BTC investor terminal with dynamic indicators."""
+
+    TITLE = "BTC INVESTOR TERMINAL"
+    SUB_TITLE = "BTC-USDT · Dynamic Indicators · AI Zones · Macro Intel"
+    BINDINGS = [
+        ("r", "refresh", "Refresh"),
+        ("a", "ai_refresh", "AI"),
+        ("p", "toggle_settings", "Settings"),
+        ("w", "weekly", "1W"),
+        ("d", "daily", "1D"),
+        ("i", "toggle_indicator", "RSI/MACD"),
+        ("q", "quit", "Quit"),
+    ]
+
+    CSS = """
+    Screen { background: #000000; color: #e0e0e0; }
+    Header { background: #1a1a1a; color: #ff8c00; }
+    Footer { background: #1a1a1a; color: #999999; }
+    #main-scroll { background: #000000; }
+    .ptitle { height: 3; padding: 0 1; border: solid #333333; background: #0a0a0a; color: #ff8c00; }
+    .panel { border: solid #333333; background: #0a0a0a; color: #e0e0e0; padding: 1; }
+    #price-chart { height: 24; padding: 0 1; border: solid #333333; background: #000000; }
+    #indicator-chart { height: 12; padding: 0 1; border: solid #333333; background: #000000; }
+    #stoch-chart { height: 12; padding: 0 1; border: solid #333333; background: #000000; }
+    #ai-analysis { height: auto; min-height: 4; padding: 1; border: solid #444400; background: #0a0a00; }
+    #macro-intel { height: auto; min-height: 4; padding: 1; border: solid #003344; background: #000a0f; }
+    #status-strip { height: 3; padding: 0 1; border: solid #333333; background: #0a0a0a; color: #ff8c00; }
+    #market-summary { height: auto; padding: 1; }
+    #news-section { height: auto; padding: 1; }
+    #settings-panel { height: auto; padding: 1; border: solid #555500; background: #0f0f00; display: none; }
+    #settings-panel.visible { display: block; }
+    #settings-panel Input { width: 10; }
+    #settings-panel Checkbox { width: auto; margin-right: 1; }
+    #settings-panel Static { width: auto; margin-right: 1; }
+    .settings-row { height: 3; }
+    """
+
+    # Reactive indicator parameters
+    ema_fast_period: reactive[int] = reactive(20)
+    ema_slow_period: reactive[int] = reactive(50)
+    rsi_period: reactive[int] = reactive(14)
+    macd_fast: reactive[int] = reactive(12)
+    macd_slow: reactive[int] = reactive(26)
+    macd_signal_p: reactive[int] = reactive(9)
+    stoch_k: reactive[int] = reactive(5)
+    stoch_d: reactive[int] = reactive(3)
+    stoch_smooth: reactive[int] = reactive(3)
+    show_ema_fast: reactive[bool] = reactive(True)
+    show_ema_slow: reactive[bool] = reactive(True)
+    show_rsi: reactive[bool] = reactive(True)
+    show_stoch: reactive[bool] = reactive(True)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dashboard_data: Payload | None = None
+        self.ai_zones_data: dict[str, Payload] = {}
+        self.macro_data: Payload | None = None
+        self.selected_timeframe = "weekly"
+        self.selected_indicator = "rsi"
+        self.last_error: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with VerticalScroll(id="main-scroll"):
+            yield Static("", id="chart-title", classes="ptitle")
+            yield Static("Starting...", id="status-strip")
+            # Settings panel (hidden by default, toggle with P)
+            with Vertical(id="settings-panel"):
+                yield Static("[bold #ff8c00]═══ INDICATOR SETTINGS ═══[/]")
+                with Horizontal(classes="settings-row"):
+                    yield Checkbox("EMA Fast", value=True, id="chk-ema-fast")
+                    yield Input(value="20", id="inp-ema-fast", placeholder="20")
+                    yield Checkbox("EMA Slow", value=True, id="chk-ema-slow")
+                    yield Input(value="50", id="inp-ema-slow", placeholder="50")
+                with Horizontal(classes="settings-row"):
+                    yield Checkbox("RSI", value=True, id="chk-rsi")
+                    yield Input(value="14", id="inp-rsi", placeholder="14")
+                    yield Checkbox("Stoch", value=True, id="chk-stoch")
+                    yield Input(value="5", id="inp-stoch-k", placeholder="K")
+                    yield Input(value="3", id="inp-stoch-d", placeholder="D")
+                    yield Input(value="3", id="inp-stoch-smooth", placeholder="Sm")
+                with Horizontal(classes="settings-row"):
+                    yield Static(" MACD (F/S/Sig):")
+                    yield Input(value="12", id="inp-macd-fast", placeholder="12")
+                    yield Input(value="26", id="inp-macd-slow", placeholder="26")
+                    yield Input(value="9", id="inp-macd-sig", placeholder="9")
+            yield PlotCanvas(mode="price", id="price-chart")
+            yield PlotCanvas(mode="indicator", id="indicator-chart")
+            yield PlotCanvas(mode="stoch", id="stoch-chart")
+            yield Static("", id="ai-analysis")
+            yield Static("", id="macro-intel")
+            yield Static("", id="market-summary", classes="panel")
+            yield Static("", id="news-section", classes="panel")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._render_dashboard()
+        self._start_refresh("initial load")
+
+    # ─── Actions ──────────────────────────────────────────────────────────────
+
+    def action_refresh(self) -> None:
+        self._start_refresh("manual")
+
+    def action_ai_refresh(self) -> None:
+        if not _get_token():
+            self._show_pat_input()
+            return
+        self._start_ai_analysis()
+
+    def action_toggle_settings(self) -> None:
+        panel = self.query_one("#settings-panel")
+        panel.toggle_class("visible")
+
+    def action_weekly(self) -> None:
+        self.selected_timeframe = "weekly"
+        self._render_dashboard()
+
+    def action_daily(self) -> None:
+        self.selected_timeframe = "daily"
+        self._render_dashboard()
+
+    def action_toggle_indicator(self) -> None:
+        self.selected_indicator = "macd" if self.selected_indicator == "rsi" else "rsi"
+        self._render_dashboard()
+
+    # ─── Settings event handlers ──────────────────────────────────────────────
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "chk-ema-fast":
+            self.show_ema_fast = event.value
+        elif event.checkbox.id == "chk-ema-slow":
+            self.show_ema_slow = event.value
+        elif event.checkbox.id == "chk-rsi":
+            self.show_rsi = event.value
+        elif event.checkbox.id == "chk-stoch":
+            self.show_stoch = event.value
+        self._render_plots()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "pat-input":
+            token = event.value.strip()
+            if token:
+                save_token(token)
+                self._update_status("Token saved permanently")
+            event.input.remove()
+            self._start_ai_analysis()
+            return
+        self._apply_settings_input(event.input.id, event.value)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Only react to settings inputs, ignore during mount/unmount
+        if not event.input.id or not event.input.id.startswith("inp-"):
+            return
+        if not event.value or not event.value.isdigit():
+            return
+        self._apply_settings_input(event.input.id, event.value)
+
+    def _apply_settings_input(self, input_id: str, value: str) -> None:
+        try:
+            v = int(value)
+            if v < 2:
+                return
+        except (ValueError, TypeError):
+            return
+        if input_id == "inp-ema-fast":
+            self.ema_fast_period = v
+        elif input_id == "inp-ema-slow":
+            self.ema_slow_period = v
+        elif input_id == "inp-rsi":
+            self.rsi_period = v
+        elif input_id == "inp-macd-fast":
+            self.macd_fast = v
+        elif input_id == "inp-macd-slow":
+            self.macd_slow = v
+        elif input_id == "inp-macd-sig":
+            self.macd_signal_p = v
+        elif input_id == "inp-stoch-k":
+            self.stoch_k = v
+        elif input_id == "inp-stoch-d":
+            self.stoch_d = v
+        elif input_id == "inp-stoch-smooth":
+            self.stoch_smooth = v
+        else:
+            return
+        self._recalculate_and_render()
+
+    def _recalculate_and_render(self) -> None:
+        """Recalculate indicators from cached candles and re-render instantly."""
+        if not self.dashboard_data:
+            return
+        for tf in ("weekly", "daily"):
+            section = self.dashboard_data.get(tf)
+            if not isinstance(section, dict):
+                continue
+            candles = section.get("candles", [])
+            if not candles:
+                continue
+            new_series = recalculate_indicators(
+                candles, self.ema_fast_period, self.ema_slow_period,
+                self.rsi_period, self.macd_fast, self.macd_slow, self.macd_signal_p,
+                self.stoch_k, self.stoch_d, self.stoch_smooth,
+            )
+            if new_series and "technical" in section:
+                section["technical"]["indicator_series"] = new_series
+        self._render_plots()
+
+    # ─── Reactive watchers ────────────────────────────────────────────────────
+
+    def watch_ema_fast_period(self, _: int) -> None:
+        self._recalculate_and_render()
+
+    def watch_ema_slow_period(self, _: int) -> None:
+        self._recalculate_and_render()
+
+    def watch_rsi_period(self, _: int) -> None:
+        self._recalculate_and_render()
+
+    def watch_macd_fast(self, _: int) -> None:
+        self._recalculate_and_render()
+
+    def watch_macd_slow(self, _: int) -> None:
+        self._recalculate_and_render()
+
+    def watch_macd_signal_p(self, _: int) -> None:
+        self._recalculate_and_render()
+
+    # ─── Data fetching ────────────────────────────────────────────────────────
+
+    def _show_pat_input(self) -> None:
+        try:
+            self.query_one("#pat-input", Input)
+            return
+        except Exception:
+            pass
+        inp = Input(placeholder="Paste GitHub PAT (models:read)...", id="pat-input")
+        self.query_one("#main-scroll").mount(inp, before=self.query_one("#status-strip"))
+        inp.focus()
+
+    def _start_refresh(self, reason: str) -> None:
+        self.last_error = None
+        self._update_status(f"Refreshing ({reason})...")
+
+        def fetch() -> None:
+            worker = get_current_worker()
+            try:
+                data = get_btc_dashboard_data()
+            except Exception as exc:
+                if not worker.is_cancelled:
+                    self.call_from_thread(self._refresh_failed, str(exc))
+            else:
+                if not worker.is_cancelled:
+                    self.call_from_thread(self._refresh_succeeded, data)
+
+        self.run_worker(fetch, name="refresh", group="refresh", exclusive=True, thread=True, exit_on_error=False)
+
+    def _start_ai_analysis(self) -> None:
+        if not self.dashboard_data:
+            return
+        self._update_status("Fetching AI zones...")
+        tf = self.selected_timeframe
+
+        def fetch_ai() -> None:
+            worker = get_current_worker()
+            section = self.dashboard_data.get(tf)
+            candles = section.get("candles", []) if isinstance(section, dict) else []
+            if not candles:
+                return
+            zones = get_ai_zones(candles, "1W" if tf == "weekly" else "1D")
+            if not worker.is_cancelled:
+                self.call_from_thread(self._ai_zones_received, tf, zones)
+
+        self.run_worker(fetch_ai, name="ai", group="ai", exclusive=True, thread=True, exit_on_error=False)
+
+    def _start_macro_fetch(self) -> None:
+        """Fetch macro intel in background."""
+        def fetch_macro() -> None:
+            worker = get_current_worker()
+            weekly_closes = None
+            if self.dashboard_data:
+                section = self.dashboard_data.get("weekly")
+                if isinstance(section, dict):
+                    candles = section.get("candles", [])
+                    weekly_closes = [c["close"] for c in candles if "close" in c]
+            try:
+                data = get_macro_intel(weekly_closes)
+            except Exception:
+                # Fallback: at least show halving + MVRV (no network needed)
+                from btc_investor_tui.macro_intel import get_halving_info, estimate_mvrv_zscore
+                data = {
+                    "halving": get_halving_info(),
+                    "fear_greed": {"value": None, "classification": "unavailable"},
+                    "mvrv": estimate_mvrv_zscore(weekly_closes) if weekly_closes else {"zscore": None, "zone": "no_data"},
+                }
+            if not worker.is_cancelled:
+                self.call_from_thread(self._macro_received, data)
+
+        self.run_worker(fetch_macro, name="macro", group="macro", exclusive=True, thread=True, exit_on_error=False)
+
+    def _ai_zones_received(self, timeframe: str, zones: Payload) -> None:
+        self.ai_zones_data[timeframe] = zones
+        self._render_dashboard()
+
+    def _macro_received(self, data: Payload) -> None:
+        self.macro_data = data
+        self._render_macro()
+
+    def _refresh_succeeded(self, data: Payload) -> None:
+        self.dashboard_data = data
+        self.last_error = None
+        self._render_dashboard()
+        self._start_ai_analysis()
+        self._start_macro_fetch()
+
+    def _refresh_failed(self, message: str) -> None:
+        self.last_error = message
+        self._render_dashboard()
+
+    # ─── Rendering ────────────────────────────────────────────────────────────
+
+    def _render_dashboard(self) -> None:
+        self._render_title()
+        self._render_plots()
+        self._render_ai_analysis()
+        self._render_macro()
+        self._render_summary()
+        self._render_feed()
+        self._render_status()
+
+    def _render_plots(self) -> None:
+        zones = self.ai_zones_data.get(self.selected_timeframe)
+        self.query_one("#price-chart", PlotCanvas).set_state(
+            self.dashboard_data, self.selected_timeframe, self.selected_indicator,
+            zones, self.show_ema_fast, self.show_ema_slow,
+            self.ema_fast_period, self.ema_slow_period,
+        )
+        # RSI chart
+        rsi_canvas = self.query_one("#indicator-chart", PlotCanvas)
+        rsi_canvas.display = self.show_rsi and self.selected_indicator == "rsi"
+        rsi_canvas.set_state(
+            self.dashboard_data, self.selected_timeframe, "rsi",
+            show_rsi=True, show_stoch=False,
+        )
+        # Stoch chart
+        stoch_canvas = self.query_one("#stoch-chart", PlotCanvas)
+        stoch_canvas.display = self.show_stoch and self.selected_indicator == "rsi"
+        stoch_canvas.set_state(
+            self.dashboard_data, self.selected_timeframe, "stoch",
+            show_rsi=False, show_stoch=True,
+        )
+        # MACD mode: hide both RSI/Stoch, show MACD in indicator-chart
+        if self.selected_indicator == "macd":
+            rsi_canvas.display = True
+            rsi_canvas.set_state(self.dashboard_data, self.selected_timeframe, "macd")
+            stoch_canvas.display = False
+
+    def _render_title(self) -> None:
+        w = self.query_one("#chart-title", Static)
+        if not self.dashboard_data:
+            w.update("[bold #ff8c00]BTC INVESTOR[/]  [#666666]waiting...[/]")
+            return
+        section = self.dashboard_data.get(self.selected_timeframe)
+        technical = section.get("technical", {}) if isinstance(section, dict) else {}
+        tf = "1W" if self.selected_timeframe == "weekly" else "1D"
+        close = _fmt_usd(technical.get("latest_close"))
+        signal = _fmt_label(technical.get("composite_signal"))
+        w.update(f"[bold #ff8c00]BTC-USDT {tf}[/]  [bold #ffffff]{close}[/]  [bold #00ff88]{escape(signal)}[/]")
+
+    def _render_ai_analysis(self) -> None:
+        panel = self.query_one("#ai-analysis", Static)
+        zones = self.ai_zones_data.get(self.selected_timeframe)
+        if not zones:
+            panel.update("[bold #ff8c00]═══ AI ZONES ═══[/]\n[#666666]Press A for AI buy/sell zones[/]")
+            return
+        lines = ["[bold #ff8c00]═══ AI ZONES ═══[/]"]
+        for z in zones.get("buy_zones", []):
+            lines.append(f"  [#00ff88]█ BUY[/]  {_fmt_usd(z.get('price_low'))} - {_fmt_usd(z.get('price_high'))}  [#666]{escape(z.get('label',''))}[/]")
+        for z in zones.get("sell_zones", []):
+            lines.append(f"  [#ff4444]█ SELL[/] {_fmt_usd(z.get('price_low'))} - {_fmt_usd(z.get('price_high'))}  [#666]{escape(z.get('label',''))}[/]")
+        analysis = zones.get("analysis", "")
+        if analysis:
+            lines.append(f"[#cccccc]{escape(analysis)}[/]")
+        panel.update("\n".join(lines))
+
+    def _render_macro(self) -> None:
+        panel = self.query_one("#macro-intel", Static)
+        if not self.macro_data:
+            panel.update("[bold #ff8c00]═══ BLOOMBERG MACRO INTEL ═══[/]\n[#666666]Loading...[/]")
+            return
+        h = self.macro_data.get("halving", {})
+        fg = self.macro_data.get("fear_greed", {})
+        mv = self.macro_data.get("mvrv", {})
+
+        # Progress bar for halving
+        pct = h.get("cycle_progress_pct", 0)
+        bar_len = 20
+        filled = int(pct / 100 * bar_len)
+        bar = f"[#00ff88]{'█' * filled}[/][#333]{'░' * (bar_len - filled)}[/]"
+
+        fng_val = fg.get("value")
+        fng_color = "#ff4444" if fng_val and fng_val < 30 else "#00ff88" if fng_val and fng_val > 60 else "#ffcc00"
+
+        lines = [
+            "[bold #ff8c00]═══ BLOOMBERG MACRO INTEL ═══[/]",
+            "",
+            f" [bold]Halving #5[/]  {bar} {pct:.1f}%",
+            f"   Block ~{h.get('current_block_est',0):,} / {h.get('next_halving_block',0):,}  │  [bold]{h.get('days_remaining',0)}d[/] remaining",
+            "",
+            f" [bold]Fear & Greed[/]  [{fng_color}]{fng_val or 'n/a'}[/] — {fg.get('classification', 'n/a')}",
+            "",
+            f" [bold]MVRV Z-Score[/]  [bold #00ccff]{mv.get('zscore', 'n/a')}[/]  │  Zone: {escape(str(mv.get('zone', 'n/a')).replace('_', ' ').title())}",
+        ]
+        panel.update("\n".join(lines))
+
+    def _render_summary(self) -> None:
+        panel = self.query_one("#market-summary", Static)
+        if not self.dashboard_data:
+            panel.update("[bold #ff8c00]MARKET[/]\n[#666666]Waiting...[/]")
+            return
+        data = self.dashboard_data
+        market = data.get("market_summary") or {}
+        quote = data.get("quote") or {}
+        section = data.get(self.selected_timeframe) or {}
+        technical = section.get("technical", {}) if isinstance(section, dict) else {}
+        moving = technical.get("moving_averages") or {}
+        osc = technical.get("oscillators") or {}
+
+        lines = [
+            "[bold #ff8c00]═══ MARKET ═══[/]",
+            f" Price  [bold #fff]{_fmt_usd(market.get('price') or quote.get('price'))}[/]  {_fmt_pct(quote.get('change_pct'))}",
+            f" Trend  [#ffcc00]{escape(_fmt_label(technical.get('trend_label')))}[/]  Risk [#ff6666]{escape(_fmt_label(technical.get('risk_label')))}[/]",
+            f" EMA{self.ema_fast_period} [#fff]{_fmt_usd(moving.get('ema_20'))}[/]  EMA{self.ema_slow_period} [#fff]{_fmt_usd(moving.get('ema_50'))}[/]",
+            f" RSI{self.rsi_period} [#00ccff]{_fmt_num(osc.get('rsi_14'))}[/]  MACD [#fff]{_fmt_num(osc.get('macd'))}[/]",
+        ]
+        panel.update("\n".join(lines))
+
+    def _render_feed(self) -> None:
+        feed = self.query_one("#news-section", Static)
+        if not self.dashboard_data:
+            feed.update("[bold #ff8c00]NEWS[/]\n[#666666]Waiting...[/]")
+            return
+        news = self.dashboard_data.get("news") or {}
+        items = news.get("items", []) if isinstance(news, dict) else []
+        sentiment = self.dashboard_data.get("reddit_sentiment") or {}
+        posts = sentiment.get("top_posts", []) if isinstance(sentiment, dict) else []
+
+        text = Text()
+        text.append("═══ NEWS ═══\n", style="bold #ff8c00")
+        for i, item in enumerate(items[:6], 1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "")
+            url = str(item.get("url") or "")
+            text.append(f" {i} ", style="bold #ffffff")
+            text.append(f"{title}\n", style=f"underline link {url}" if url.startswith("http") else "")
+
+        if posts:
+            text.append("\n═══ REDDIT ═══\n", style="bold #ff8c00")
+            for post in posts[:3]:
+                if not isinstance(post, dict):
+                    continue
+                title = _shorten(str(post.get("title") or ""), 80)
+                url = str(post.get("url") or "")
+                text.append(f" {title}\n", style=f"underline link {url}" if url.startswith("http") else "")
+
+        if not items and not posts:
+            text.append("No news available\n", style="#666666")
+
+        feed.update(text)
+
+    def _render_status(self) -> None:
+        if self.last_error:
+            self._update_status(f"ERR: {self.last_error}")
+            return
+        if not self.dashboard_data:
+            return
+        tf = "1W" if self.selected_timeframe == "weekly" else "1D"
+        ind = self.selected_indicator.upper()
+        self._update_status(f"{tf} | {ind} | EMA{self.ema_fast_period}/{self.ema_slow_period} | R A P W D I Q")
+
+    def _update_status(self, msg: str) -> None:
+        self.query_one("#status-strip", Static).update(f"[bold #ff8c00]▶[/] {escape(msg)}")
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _fmt_usd(v: Any) -> str:
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"${n:,.0f}" if math.isfinite(n) else "n/a"
+
+
+def _fmt_pct(v: Any) -> str:
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(n):
+        return ""
+    c = "#00ff88" if n >= 0 else "#ff4444"
+    return f"[bold {c}]{n:+.2f}%[/]"
+
+
+def _fmt_num(v: Any, d: int = 2) -> str:
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{n:,.{d}f}" if math.isfinite(n) else "n/a"
+
+
+def _fmt_label(v: Any) -> str:
+    if v is None:
+        return "n/a"
+    if isinstance(v, dict):
+        label = str(v.get("label") or "n/a")
+        score = v.get("score")
+        s = label.replace("_", " ").title()
+        return f"{s} ({score:+d})" if score is not None else s
+    return str(v).replace("_", " ").title()
+
+
+def _shorten(s: str, limit: int) -> str:
+    t = " ".join(s.split())
+    return t if len(t) <= limit else f"{t[:limit-3].rstrip()}..."
+
+
+def main() -> None:
+    BTCInvestorApp().run()
+
+
+if __name__ == "__main__":
+    main()
